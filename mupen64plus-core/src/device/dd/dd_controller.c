@@ -21,6 +21,7 @@
 
 #include "dd_controller.h"
 
+#include <stdlib.h>
 #include <assert.h>
 #include <string.h>
 #include <time.h>
@@ -30,6 +31,7 @@
 #include "api/callbacks.h"
 #include "backends/api/clock_backend.h"
 #include "backends/api/storage_backend.h"
+#include "device/dd/disk.h"
 #include "device/device.h"
 #include "device/memory/memory.h"
 #include "device/r4300/r4300_core.h"
@@ -95,59 +97,6 @@
 
 #define DD_TRACK_LOCK           UINT32_C(0x60000000)
 
-/* disk geometry definitions */
-enum { SECTORS_PER_BLOCK = 85 };
-enum { BLOCKS_PER_TRACK  = 2  };
-
-enum { DD_DISK_SYSTEM_DATA_SIZE = 0xe8 };
-
-static const unsigned int zone_sec_size[16] = {
-    232, 216, 208, 192, 176, 160, 144, 128,
-    216, 208, 192, 176, 160, 144, 128, 112
-};
-
-static const uint32_t ZoneTracks[16] = {
-    158, 158, 149, 149, 149, 149, 149, 114,
-    158, 158, 149, 149, 149, 149, 149, 114
-};
-static const uint32_t DiskTypeZones[7][16] = {
-    { 0, 1, 2, 9, 8, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10 },
-    { 0, 1, 2, 3, 10, 9, 8, 4, 5, 6, 7, 15, 14, 13, 12, 11 },
-    { 0, 1, 2, 3, 4, 11, 10, 9, 8, 5, 6, 7, 15, 14, 13, 12 },
-    { 0, 1, 2, 3, 4, 5, 12, 11, 10, 9, 8, 6, 7, 15, 14, 13 },
-    { 0, 1, 2, 3, 4, 5, 6, 13, 12, 11, 10, 9, 8, 7, 15, 14 },
-    { 0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8, 15 },
-    { 0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8 }
-};
-static const uint32_t RevDiskTypeZones[7][16] = {
-    { 0, 1, 2, 5, 6, 7, 8, 9, 4, 3, 15, 14, 13, 12, 11, 10 },
-    { 0, 1, 2, 3, 7, 8, 9, 10, 6, 5, 4, 15, 14, 13, 12, 11 },
-    { 0, 1, 2, 3, 4, 9, 10, 11, 8, 7, 6, 5, 15, 14, 13, 12 },
-    { 0, 1, 2, 3, 4, 5, 11, 12, 10, 9, 8, 7, 6, 15, 14, 13 },
-    { 0, 1, 2, 3, 4, 5, 6, 13, 12, 11, 10, 9, 8, 7, 15, 14 },
-    { 0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8, 15 },
-    { 0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8 }
-};
-static const uint32_t StartBlock[7][16] = {
-    { 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1 },
-    { 0, 0, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0 },
-    { 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1, 1 },
-    { 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0 },
-    { 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1 },
-    { 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0 },
-    { 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1 }
-};
-
-
-#define BLOCKSIZE(_zone) zone_sec_size[_zone] * SECTORS_PER_BLOCK
-#define TRACKSIZE(_zone) BLOCKSIZE(_zone) * BLOCKS_PER_TRACK
-#define ZONESIZE(_zone) TRACKSIZE(_zone) * ZoneTracks[_zone]
-#define VZONESIZE(_zone) TRACKSIZE(_zone) * (ZoneTracks[_zone] - 0xC)
-
-
-
-
-
 
 static uint8_t byte2bcd(int n)
 {
@@ -181,85 +130,135 @@ static void clear_dd_interrupt(struct dd_controller* dd, uint32_t bm_int)
     r4300_check_interrupt(dd->r4300, CP0_CAUSE_IP3, 0);
 }
 
+void dd_mecha_int_handler(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    /* clear busy state flag */
+    dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_BUSY_STATE;
+    signal_dd_interrupt(dd, DD_STATUS_MECHA_INT);
+}
+
+void dd_bm_int_handler(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    dd_update_bm(dd);
+}
+
+void dd_dv_active(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    /* make motor active and prep standby */
+    dd->regs[DD_ASIC_CMD_STATUS] &= ~(DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT);
+    remove_event(&dd->r4300->cp0.q, DD_DV_INT);
+    if (dd->timer_standby >= 0) {
+        add_interrupt_event(&dd->r4300->cp0, DD_DV_INT, 46875000 * dd->timer_standby);
+    }
+}
+
+void dd_dv_standby(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    /* make motor standby and prep sleep */
+    dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_MTR_N_SPIN;
+    dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_HEAD_RTRCT;
+    remove_event(&dd->r4300->cp0.q, DD_DV_INT);
+    if (dd->timer_sleep >= 0) {
+        add_interrupt_event(&dd->r4300->cp0, DD_DV_INT, 46875000 * dd->timer_sleep);
+    }
+}
+
+void dd_dv_sleep(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    /* make motor sleep */
+    dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT;
+    remove_event(&dd->r4300->cp0.q, DD_DV_INT);
+}
+
+void dd_dv_int_handler(void* opaque)
+{
+    struct dd_controller* dd = (struct dd_controller*)opaque;
+    /* manage drive motor modes (active, standby, sleep) */
+    int motorNotSpinning = (dd->regs[DD_ASIC_CMD_STATUS] & DD_STATUS_MTR_N_SPIN) != 0;
+    int headRetracted = (dd->regs[DD_ASIC_CMD_STATUS] & DD_STATUS_HEAD_RTRCT) != 0;
+
+    if (!motorNotSpinning && headRetracted) {
+        /* standby to sleep */
+        dd_dv_sleep(dd);
+        DebugMessage(M64MSG_VERBOSE, "Disk drive motor put to sleep mode (auto)");
+    }
+
+    if (!motorNotSpinning && !headRetracted) {
+        /* active to standby, prep time to sleep */
+        dd_dv_standby(dd);
+        DebugMessage(M64MSG_VERBOSE, "Disk drive motor put to standby mode (auto)");
+    }
+}
+
 static void read_C2(struct dd_controller* dd)
 {
     size_t i;
 
     size_t length = zone_sec_size[dd->bm_zone];
-    size_t offset = 0x40 * (dd->regs[DD_ASIC_CUR_SECTOR] - SECTORS_PER_BLOCK);
+    unsigned int sector = (dd->regs[DD_ASIC_CUR_SECTOR] >> 16) & 0xff;
+    sector %= 90;
+    size_t offset = 0x40 * (sector - SECTORS_PER_BLOCK);
 
-    DebugMessage(M64MSG_VERBOSE, "read C2: length=%08x, offset=%08x",
-            (uint32_t)length, (uint32_t)offset);
+    //DebugMessage(M64MSG_VERBOSE, "read C2: length=%08x, offset=%08x",
+    //        (uint32_t)length, (uint32_t)offset);
 
     for (i = 0; i < length; ++i) {
         dd->c2s_buf[(offset + i) ^ 3] = 0;
     }
 }
 
+static uint8_t* seek_sector(struct dd_controller* dd)
+{
+    unsigned int head  = (dd->regs[DD_ASIC_CUR_TK] & 0x10000000) >> 28;
+    unsigned int track = (dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16;
+    // XXX: takes into account that for writes dd_update_bm use the previous sector.
+    unsigned int sector = ((dd->regs[DD_ASIC_CUR_SECTOR] >> 16) & 0xff) - dd->bm_write;
+    unsigned int block = sector / 90;
+    sector %= 90;
+
+    uint8_t* sector_base = get_sector_base(dd->disk, head, track, block, sector);
+    if (sector_base == NULL) {
+        dd->regs[DD_ASIC_BM_STATUS_CTL] |= DD_BM_STATUS_MICRO;
+    }
+
+    return sector_base;
+}
+
 static void read_sector(struct dd_controller* dd)
 {
     size_t i;
-    const uint8_t* disk_mem = dd->idisk->data(dd->disk);
-    size_t offset = dd->bm_track_offset
-        + dd->bm_block * BLOCKSIZE(dd->bm_zone)
-        + dd->regs[DD_ASIC_CUR_SECTOR] * (dd->regs[DD_ASIC_HOST_SECBYTE] + 1);
+    const uint8_t* disk_sec = seek_sector(dd);
+    if (disk_sec == NULL) {
+        return;
+    }
+
     size_t length = dd->regs[DD_ASIC_HOST_SECBYTE] + 1;
 
     for (i = 0; i < length; ++i) {
-        dd->ds_buf[i ^ 3] = disk_mem[offset + i];
+        dd->ds_buf[i ^ 3] = disk_sec[i];
     }
 }
 
 static void write_sector(struct dd_controller* dd)
 {
     size_t i;
-    uint8_t* disk_mem = dd->idisk->data(dd->disk);
-    size_t offset = dd->bm_track_offset
-        + dd->bm_block * BLOCKSIZE(dd->bm_zone)
-        + (dd->regs[DD_ASIC_CUR_SECTOR] - 1) * zone_sec_size[dd->bm_zone];
-    size_t length = zone_sec_size[dd->bm_zone];
+    uint8_t* disk_sec = seek_sector(dd);
+    if (disk_sec == NULL) {
+        return;
+    }
+
+    size_t length = dd->regs[DD_ASIC_HOST_SECBYTE] + 1;
 
 	for (i = 0; i < length; ++i) {
-		disk_mem[offset + i] = dd->ds_buf[i ^ 3];
+		disk_sec[i] = dd->ds_buf[i ^ 3];
     }
 
-#if 0 /* disabled for now, because it causes too much slowdowns */
-    dd->idisk->save(dd->disk);
-#endif
-}
-
-static void seek_track(struct dd_controller* dd)
-{
-    static const unsigned int start_offset[] = {
-        0x0000000, 0x05f15e0, 0x0b79d00, 0x10801a0,
-        0x1523720, 0x1963d80, 0x1d414c0, 0x20bbce0,
-        0x23196e0, 0x28a1e00, 0x2df5dc0, 0x3299340,
-        0x36d99a0, 0x3ab70e0, 0x3e31900, 0x4149200
-    };
-
-    static const unsigned int tracks[] = {
-        0x000, 0x09e, 0x13c, 0x1d1, 0x266, 0x2fb, 0x390, 0x425
-    };
-
-	unsigned int tr_off;
-	unsigned int head_x_8 = ((dd->regs[DD_ASIC_CUR_TK] & 0x1000) >> 9);
-	unsigned int track    =  (dd->regs[DD_ASIC_CUR_TK] & 0x0fff);
-
-    /* find track bm_zone */
-    for (dd->bm_zone = 7; dd->bm_zone > 0; --dd->bm_zone) {
-        if (track >= tracks[dd->bm_zone]) {
-            break;
-        }
-    }
-
-    tr_off = track - tracks[dd->bm_zone];
-
-    /* set zone and track offset */
-    dd->bm_zone += head_x_8;
-	dd->bm_track_offset = start_offset[dd->bm_zone] + tr_off * TRACKSIZE(dd->bm_zone);
-
-    /* lock track */
-    dd->regs[DD_ASIC_CUR_TK] |= DD_TRACK_LOCK;
+    dd->idisk->save(dd->disk, disk_sec - dd->idisk->data(dd->disk), length);
 }
 
 void dd_update_bm(void* opaque)
@@ -271,32 +270,46 @@ void dd_update_bm(void* opaque)
 		return;
     }
 
+    /* clear flags */
+    dd->regs[DD_ASIC_CMD_STATUS] &= ~(DD_STATUS_DATA_RQ | DD_STATUS_C2_XFER);
+
+    /* calculate sector and block info for use later */
+    unsigned int sector = (dd->regs[DD_ASIC_CUR_SECTOR] >> 16) & 0xff;
+    unsigned int block = sector / 90;
+    sector %= 90;
+
     /* handle writes (BM mode 0) */
     if (dd->bm_write) {
+        /* do not write anything and stop BM if the track being written is write protected */
+        if (dd->regs[DD_ASIC_CMD_STATUS] & DD_STATUS_WR_PR_ERR) {
+            dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_BM_ERR;
+            dd->regs[DD_ASIC_BM_STATUS_CTL] |= DD_BM_STATUS_MICRO;
+            dd->regs[DD_ASIC_BM_STATUS_CTL] &= ~DD_BM_STATUS_RUNNING;
+        }
         /* first sector : just issue a BM interrupt to get things going */
-        if (dd->regs[DD_ASIC_CUR_SECTOR] == 0) {
-            ++dd->regs[DD_ASIC_CUR_SECTOR];
+        else if (sector == 0) {
+            dd->regs[DD_ASIC_CUR_SECTOR] += 0x10000;
             dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_DATA_RQ;
         }
         /* subsequent sectors: write previous sector */
-        else if (dd->regs[DD_ASIC_CUR_SECTOR] < SECTORS_PER_BLOCK) {
+        else if (sector < SECTORS_PER_BLOCK) {
             write_sector(dd);
-            ++dd->regs[DD_ASIC_CUR_SECTOR];
+            dd->regs[DD_ASIC_CUR_SECTOR] += 0x10000;
             dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_DATA_RQ;
         }
         /* otherwise write last sector */
-        else if (dd->regs[DD_ASIC_CUR_SECTOR] < SECTORS_PER_BLOCK + 1) {
+        else if (sector < SECTORS_PER_BLOCK + 1) {
+            write_sector(dd);
+
             /* continue to next block */
             if (dd->regs[DD_ASIC_BM_STATUS_CTL] & DD_BM_STATUS_BLOCK) {
-                write_sector(dd);
-                dd->bm_block = 1 - dd->bm_block;
-                dd->regs[DD_ASIC_CUR_SECTOR] = 1;
+                // Start at next block sector 1.
+                dd->regs[DD_ASIC_CUR_SECTOR] = ((1 - block) * 90 + 1) << 16;
                 dd->regs[DD_ASIC_BM_STATUS_CTL] &= ~DD_BM_STATUS_BLOCK;
                 dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_DATA_RQ;
             /* quit writing after second block */
             } else {
-                write_sector(dd);
-                ++dd->regs[DD_ASIC_CUR_SECTOR];
+                dd->regs[DD_ASIC_CUR_SECTOR] += 0x10000;
                 dd->regs[DD_ASIC_BM_STATUS_CTL] &= ~DD_BM_STATUS_RUNNING;
             }
         }
@@ -306,30 +319,30 @@ void dd_update_bm(void* opaque)
     }
     /* handle reads (BM mode 1) */
     else {
+        uint8_t dev = dd->disk->development;
         /* track 6 fails to read on retail units (XXX: retail test) */
-        if (((dd->regs[DD_ASIC_CUR_TK] & 0x1fff) == 6) && dd->bm_block == 0) {
+        if ((((dd->regs[DD_ASIC_CUR_TK] >> 16) & 0x1fff) == 6) && block == 0 && !dev) {
             dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_DATA_RQ;
             dd->regs[DD_ASIC_BM_STATUS_CTL] |= DD_BM_STATUS_MICRO;
         }
         /* data sectors : read sector and signal BM interrupt */
-        else if (dd->regs[DD_ASIC_CUR_SECTOR] < SECTORS_PER_BLOCK) {
+        else if (sector < SECTORS_PER_BLOCK) {
             read_sector(dd);
-            ++dd->regs[DD_ASIC_CUR_SECTOR];
+            dd->regs[DD_ASIC_CUR_SECTOR] += 0x10000;
             dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_DATA_RQ;
         }
         /* C2 sectors: do nothing since they're loaded with zeros */
-        else if (dd->regs[DD_ASIC_CUR_SECTOR] < SECTORS_PER_BLOCK + 4) {
+        else if (sector < SECTORS_PER_BLOCK + 3) {
             read_C2(dd);
-            ++dd->regs[DD_ASIC_CUR_SECTOR];
-            if (dd->regs[DD_ASIC_CUR_SECTOR] == SECTORS_PER_BLOCK + 4) {
-                dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_C2_XFER;
-            }
+            dd->regs[DD_ASIC_CUR_SECTOR] += 0x10000;
         }
-        /* Gap sector: continue to next block, quit after second block */
-        else if (dd->regs[DD_ASIC_CUR_SECTOR] == SECTORS_PER_BLOCK + 4) {
+        /* Last C2 sector: continue to next block, quit after second block */
+        else if (sector == SECTORS_PER_BLOCK + 3) {
+            read_C2(dd);
+            dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_C2_XFER;
             if (dd->regs[DD_ASIC_BM_STATUS_CTL] & DD_BM_STATUS_BLOCK) {
-                dd->bm_block = 1 - dd->bm_block;
-                dd->regs[DD_ASIC_CUR_SECTOR] = 0;
+                // Start at next block sector 0.
+                dd->regs[DD_ASIC_CUR_SECTOR] = ((1 - block) * 90 + 0) << 16;
                 dd->regs[DD_ASIC_BM_STATUS_CTL] &= ~DD_BM_STATUS_BLOCK;
             }
             else {
@@ -341,6 +354,9 @@ void dd_update_bm(void* opaque)
         }
     }
 
+    /* Make sure motor is still considered active */
+    dd_dv_active(dd);
+
     /* Signal a BM interrupt */
     signal_dd_interrupt(dd, DD_STATUS_BM_INT);
 }
@@ -350,7 +366,7 @@ void dd_update_bm(void* opaque)
 void init_dd(struct dd_controller* dd,
              void* clock, const struct clock_backend_interface* iclock,
              const uint32_t* rom, size_t rom_size,
-             void* disk, const struct storage_backend_interface* idisk,
+             struct dd_disk* disk, const struct storage_backend_interface* idisk,
              struct r4300_core* r4300)
 {
     dd->rtc.clock = clock;
@@ -374,20 +390,22 @@ void poweron_dd(struct dd_controller* dd)
 
     dd->bm_write = 0;
     dd->bm_reset_held = 0;
-    dd->bm_block = 0;
     dd->bm_zone = 0;
-    dd->bm_track_offset = 0;
 
     dd->rtc.now = 0;
     dd->rtc.last_update_rtc = 0;
 
+    dd->timer_sleep = 1;
+    dd->timer_standby = 3;
+    dd_dv_sleep(dd);
+
+    dd->regs[DD_ASIC_ID_REG] = 0x00030000;
     dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_RST_STATE;
     if (dd->idisk != NULL) {
         dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_DISK_PRES;
+        if (dd->disk->development)
+            dd->regs[DD_ASIC_ID_REG] = 0x00040000;
     }
-
-    /* XXX: add non retail support */
-    dd->regs[DD_ASIC_ID_REG] = 0x00030000;
 }
 
 void read_dd_regs(void* opaque, uint32_t address, uint32_t* value)
@@ -413,16 +431,16 @@ void read_dd_regs(void* opaque, uint32_t address, uint32_t* value)
     }
 
     *value = dd->regs[reg];
-    DebugMessage(M64MSG_VERBOSE, "DD REG: %08X -> %08x", address, *value);
+    //DebugMessage(M64MSG_VERBOSE, "DD REG: %08X -> %08x", address, *value);
 
     /* post read update. Not part of the returned value */
     switch(reg)
     {
     case DD_ASIC_CMD_STATUS: {
-            /* clear BM interrupt when reading gap */
-            if ((dd->regs[DD_ASIC_CMD_STATUS] & DD_STATUS_BM_INT) && (dd->regs[DD_ASIC_CUR_SECTOR] > SECTORS_PER_BLOCK)) {
+            /* acknowledge BM interrupt */
+            if (dd->regs[DD_ASIC_CMD_STATUS] & DD_STATUS_BM_INT) {
                 clear_dd_interrupt(dd, DD_STATUS_BM_INT);
-                dd_update_bm(dd);
+                add_interrupt_event(&dd->r4300->cp0, DD_BM_INT, 8020 + (((dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16) / 56));
             }
         } break;
     }
@@ -430,7 +448,8 @@ void read_dd_regs(void* opaque, uint32_t address, uint32_t* value)
 
 void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask)
 {
-    uint8_t start_sector;
+    unsigned int head, track, old_track, cycles;
+    const uint16_t startTrackZones[9] = { 0x000, 0x09E, 0x13C, 0x1D1, 0x266, 0x2FB, 0x390, 0x425, 0x497 };
     struct dd_controller* dd = (struct dd_controller*)opaque;
 
     if (address < MM_DD_REGS || address >= MM_DD_MS_RAM) {
@@ -442,7 +461,7 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
 
     assert(mask == ~UINT32_C(0));
 
-    DebugMessage(M64MSG_VERBOSE, "DD REG: %08X <- %08x", address, value);
+    //DebugMessage(M64MSG_VERBOSE, "DD REG: %08X <- %08x", address, value);
 
     switch (reg)
     {
@@ -454,6 +473,12 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
         update_rtc(&dd->rtc);
         const struct tm* tm = localtime(&dd->rtc.now);
 
+        /* base cycle count */
+        cycles = 2000;
+
+        /* say the drive is busy while processing the command */
+        dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_BUSY_STATE;
+
         switch ((value >> 16) & 0xff)
         {
         /* No-op */
@@ -463,9 +488,102 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
         /* Seek track */
         case 0x01:
         case 0x02:
-            dd->regs[DD_ASIC_CUR_TK] = dd->regs[DD_ASIC_DATA] >> 16;
-            seek_track(dd);
+            /* base timing cycle count for Seek track CMD */
+            cycles = 248250;
+            /* check if motor is active or not, if not, add more cycles */
+            if ((dd->regs[DD_ASIC_CMD_STATUS] & (DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT)) != 0) {
+                //divided by 100 because F-Zero X Expansion Kit really dislikes anything higher
+                cycles += 501750;
+            }
+            /* make motor active */
+            dd_dv_active(dd);
+            /* get old track for calculating extra cycles */
+            old_track = (dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16;
+            /* update track */
+            dd->regs[DD_ASIC_CUR_TK] = dd->regs[DD_ASIC_DATA];
+            /* lock track */
+            dd->regs[DD_ASIC_CUR_TK] |= DD_TRACK_LOCK;
             dd->bm_write = (value >> 17) & 0x1;
+            /* update bm_zone */
+            head  = (dd->regs[DD_ASIC_CUR_TK] & 0x10000000) >> 28;
+            track = (dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16;
+            dd->bm_zone = (get_zone_from_head_track(head, track) - head) + 8*head;
+            /* calculate track to track head movement timing */
+            cycles += 4825 * abs(track - old_track);
+            /* if write seek command, check if the track is writable */
+            dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_WR_PR_ERR;
+            if (dd->bm_write) {
+                if (track < startTrackZones[(dd->disk_type & 0xf) - head + 3]) {
+                    dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_WR_PR_ERR;
+                }
+            }
+            break;
+
+        /* Rezero / Start (Seek to track 0) */
+        case 0x03:
+        case 0x05:
+            /* both commands do the exact same thing */
+            /* base timing cycle count for Seek track CMD */
+            cycles = 248250;
+            /* check if motor is active or not, if not, add more cycles */
+            if ((dd->regs[DD_ASIC_CMD_STATUS] & (DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT)) != 0) {
+                //divided by 100 because F-Zero X Expansion Kit really dislikes anything higher
+                cycles += 501750;
+            }
+            /* make motor active */
+            dd_dv_active(dd);
+            /* get old track for calculating extra cycles */
+            old_track = (dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16;
+            /* update track to 0 */
+            dd->regs[DD_ASIC_CUR_TK] = 0;
+            /* lock track */
+            dd->regs[DD_ASIC_CUR_TK] |= DD_TRACK_LOCK;
+            dd->bm_write = 1;
+            /* update bm_zone */
+            head = (dd->regs[DD_ASIC_CUR_TK] & 0x10000000) >> 28;
+            track = (dd->regs[DD_ASIC_CUR_TK] & 0x0fff0000) >> 16;
+            dd->bm_zone = (get_zone_from_head_track(head, track) - head) + 8 * head;
+            /* calculate track to track head movement timing */
+            cycles += 4825 * abs(track - old_track);
+            break;
+
+        /* Sleep / Brake */
+        case 0x04:
+            if ((dd->regs[DD_ASIC_CMD_STATUS] & (DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT)) != 0) {
+                //divided by 100 because F-Zero X Expansion Kit really dislikes anything higher
+                cycles = 207500;
+            }
+            dd_dv_sleep(dd);
+            if (dd->regs[DD_ASIC_DATA] == 0)
+            {
+                DebugMessage(M64MSG_VERBOSE, "Disk drive motor put to sleep mode");
+            }
+            else
+            {
+                DebugMessage(M64MSG_VERBOSE, "Disk drive motor put to brake mode");
+            }
+            break;
+
+        /* Set standby delay */
+        case 0x06:
+            if ((dd->regs[DD_ASIC_DATA] & 0x01000000) == 0) {
+                dd->timer_standby = (dd->regs[DD_ASIC_DATA] >> 16) & 0xff;
+                DebugMessage(M64MSG_VERBOSE, "Set disk drive standby delay to %u seconds", dd->timer_standby);
+            } else {
+                dd->timer_standby = -1;
+                DebugMessage(M64MSG_VERBOSE, "Disable disk drive standby delay");
+            }
+            break;
+
+        /* Set sleep delay */
+        case 0x07:
+            if ((dd->regs[DD_ASIC_DATA] & 0x01000000) == 0) {
+                dd->timer_sleep = (dd->regs[DD_ASIC_DATA] >> 16) & 0xff;
+                DebugMessage(M64MSG_VERBOSE, "Set disk drive sleep delay to %u seconds", dd->timer_sleep);
+            } else {
+                dd->timer_sleep = -1;
+                DebugMessage(M64MSG_VERBOSE, "Disable disk drive sleep delay");
+            }
             break;
 
         /* Clear Disk change flag */
@@ -479,9 +597,60 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
             dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_DISK_CHNG;
             break;
 
+        /* Read ASIC version */
+        case 0x0a:
+            if (dd->regs[DD_ASIC_DATA] == 0)
+            {
+                dd->regs[DD_ASIC_DATA] = 0x01140000;
+                if (dd->disk->development)
+                    dd->regs[DD_ASIC_DATA] |= 0x10000000;
+            }
+            else
+            {
+                dd->regs[DD_ASIC_DATA] = 0x53000000;
+            }
+            break;
+
         /* Set Disk type */
         case 0x0b:
-            DebugMessage(M64MSG_VERBOSE, "Setting disk type %u", (dd->regs[DD_ASIC_DATA] >> 16) & 0xf);
+            dd->disk_type = (dd->regs[DD_ASIC_DATA] >> 16) & 0xf;
+            if (dd->disk_type > 6) {
+                DebugMessage(M64MSG_VERBOSE, "Setting invalid disk type %u, set to fallback disk type 6", dd->disk_type);
+                dd->disk_type = 6;
+            } else {
+                DebugMessage(M64MSG_VERBOSE, "Setting disk type %u", dd->disk_type);
+            }
+            break;
+
+        /* Request controller status */
+        case 0x0c:
+            dd->regs[DD_ASIC_DATA] = 0;
+            break;
+
+        /* Standby */
+        case 0x0d:
+            if ((dd->regs[DD_ASIC_CMD_STATUS] & (DD_STATUS_MTR_N_SPIN | DD_STATUS_HEAD_RTRCT)) != 0) {
+                //divided by 100 because F-Zero X Expansion Kit really dislikes anything higher
+                cycles = 160000;
+            }
+            dd_dv_standby(dd);
+            DebugMessage(M64MSG_VERBOSE, "Disk drive motor put to standby mode");
+            break;
+
+        /* Retry index lock */
+        case 0x0e:
+            DebugMessage(M64MSG_VERBOSE, "Retry disk track lock");
+            break;
+
+        /* Write RTC from ASIC_DATA (BCD format) */
+        case 0x0f:
+            DebugMessage(M64MSG_VERBOSE, "Write 64DD RTC Year %02x, Month %02x", (dd->regs[DD_ASIC_DATA] & 0xff000000) >> 24, (dd->regs[DD_ASIC_DATA] & 0x00ff0000) >> 16);
+            break;
+        case 0x10:
+            DebugMessage(M64MSG_VERBOSE, "Write 64DD RTC Day %02x, Hour %02x", (dd->regs[DD_ASIC_DATA] & 0xff000000) >> 24, (dd->regs[DD_ASIC_DATA] & 0x00ff0000) >> 16);
+            break;
+        case 0x11:
+            DebugMessage(M64MSG_VERBOSE, "Write 64DD RTC Minute %02x, Second %02x", (dd->regs[DD_ASIC_DATA] & 0xff000000) >> 24, (dd->regs[DD_ASIC_DATA] & 0x00ff0000) >> 16);
             break;
 
         /* Read RTC in ASIC_DATA (BCD format) */
@@ -495,9 +664,14 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
             dd->regs[DD_ASIC_DATA] = time2data(tm->tm_min, tm->tm_sec);
             break;
 
+        /* LED On/Off Timing */
+        case 0x15:
+            DebugMessage(M64MSG_VERBOSE, "LED ON Time %02x, LED OFF Time %02x", (dd->regs[DD_ASIC_DATA] & 0xff000000) >> 24, (dd->regs[DD_ASIC_DATA] & 0x00ff0000) >> 16);
+            break;
+
         /* Feature inquiry */
         case 0x1b:
-            dd->regs[DD_ASIC_DATA] = 0x00000000;
+            dd->regs[DD_ASIC_DATA] = 0x00030000;
             break;
 
         default:
@@ -505,26 +679,21 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
         }
 
         /* Signal a MECHA interrupt */
-        signal_dd_interrupt(dd, DD_STATUS_MECHA_INT);
+        cp0_update_count(dd->r4300);
+        add_interrupt_event(&dd->r4300->cp0, DD_MC_INT, cycles);
         break;
 
     case DD_ASIC_BM_STATUS_CTL:
         /* set sector */
-        start_sector = (value >> 16) & 0xff;
-        if (start_sector == 0x00) {
-            dd->bm_block = 0;
-            dd->regs[DD_ASIC_CUR_SECTOR] = 0;
-        } else if (start_sector == 0x5a) {
-            dd->bm_block = 1;
-            dd->regs[DD_ASIC_CUR_SECTOR] = 0;
-        }
-        else {
-            DebugMessage(M64MSG_ERROR, "Start sector not aligned");
+        dd->regs[DD_ASIC_CUR_SECTOR] = (value & 0x00ff0000);
+        if (dd->regs[DD_ASIC_CUR_SECTOR] != 0 && dd->regs[DD_ASIC_CUR_SECTOR] != 0x005a0000) {
+            DebugMessage(M64MSG_ERROR, "Start sector not aligned %08x", dd->regs[DD_ASIC_CUR_SECTOR]);
         }
 
         /* clear MECHA interrupt */
         if (value & DD_BM_CTL_MECHA_RST) {
             dd->regs[DD_ASIC_CMD_STATUS] &= ~DD_STATUS_MECHA_INT;
+            remove_event(&dd->r4300->cp0.q, DD_MC_INT);
         }
         /* start block transfer */
         if (value & DD_BM_CTL_BLK_TRANS) {
@@ -542,7 +711,7 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
                                             | DD_STATUS_BM_INT);
             dd->regs[DD_ASIC_BM_STATUS_CTL] = 0;
             dd->regs[DD_ASIC_CUR_SECTOR] = 0;
-            dd->bm_block = 0;
+            remove_event(&dd->r4300->cp0.q, DD_BM_INT);
         }
 
         /* clear DD interrupt if both MECHA and BM are cleared */
@@ -559,7 +728,7 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
                 DebugMessage(M64MSG_WARNING, "Attempt to read disk with BM mode 0");
             }
             dd->regs[DD_ASIC_BM_STATUS_CTL] |= DD_BM_STATUS_RUNNING;
-            dd_update_bm(dd);
+            add_interrupt_event(&dd->r4300->cp0, DD_BM_INT, 12500);
         }
         break;
 
@@ -567,6 +736,19 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
         if (value != 0xaaaa0000) {
             DebugMessage(M64MSG_WARNING, "Unexpected hard reset value %08x", value);
         }
+        remove_event(&dd->r4300->cp0.q, DD_MC_INT);
+        remove_event(&dd->r4300->cp0.q, DD_BM_INT);
+        dd->regs[DD_ASIC_CMD_STATUS] &= ~(DD_STATUS_DATA_RQ
+                                        | DD_STATUS_C2_XFER
+                                        | DD_STATUS_BM_ERR
+                                        | DD_STATUS_BM_INT
+                                        | DD_STATUS_BUSY_STATE);
+        dd->regs[DD_ASIC_BM_STATUS_CTL] = 0;
+        dd->regs[DD_ASIC_CUR_SECTOR] = 0;
+        dd->timer_sleep = 1;
+        dd->timer_standby = 3;
+        dd_dv_sleep(dd);
+        clear_dd_interrupt(dd, DD_STATUS_MECHA_INT);
         dd->regs[DD_ASIC_CMD_STATUS] |= DD_STATUS_RST_STATE;
         break;
 
@@ -586,6 +768,11 @@ void write_dd_regs(void* opaque, uint32_t address, uint32_t value, uint32_t mask
         }
         break;
 
+    case DD_ASIC_CUR_TK: /* fallthrough */
+    case DD_ASIC_CUR_SECTOR:
+        DebugMessage(M64MSG_WARNING, "Trying to write to read-only registers: %08x <- %08x", address, value);
+        break;
+
     default:
         dd->regs[reg] = value;
     }
@@ -599,12 +786,12 @@ void read_dd_rom(void* opaque, uint32_t address, uint32_t* value)
 
     *value = dd->rom[addr];
 
-    DebugMessage(M64MSG_VERBOSE, "DD ROM: %08X -> %08x", address, *value);
+    //DebugMessage(M64MSG_VERBOSE, "DD ROM: %08X -> %08x", address, *value);
 }
 
 void write_dd_rom(void* opaque, uint32_t address, uint32_t value, uint32_t mask)
 {
-    DebugMessage(M64MSG_VERBOSE, "DD ROM: %08X <- %08x & %08x", address, value, mask);
+    //DebugMessage(M64MSG_VERBOSE, "DD ROM: %08X <- %08x & %08x", address, value, mask);
 }
 
 unsigned int dd_dom_dma_read(void* opaque, const uint8_t* dram, uint32_t dram_addr, uint32_t cart_addr, uint32_t length)
@@ -613,24 +800,32 @@ unsigned int dd_dom_dma_read(void* opaque, const uint8_t* dram, uint32_t dram_ad
     uint8_t* mem;
     size_t i;
 
-    DebugMessage(M64MSG_VERBOSE, "DD DMA read dram=%08x  cart=%08x length=%08x",
-            dram_addr, cart_addr, length);
+    //DebugMessage(M64MSG_VERBOSE, "DD DMA read dram=%08x  cart=%08x length=%08x",
+    //        dram_addr, cart_addr, length);
 
     if (cart_addr == MM_DD_DS_BUFFER) {
         cart_addr = (cart_addr - MM_DD_DS_BUFFER) & 0x3fffff;
         mem = dd->ds_buf;
     }
+    else if (cart_addr == MM_DD_MS_RAM) {
+        /* MS is not emulated, we silence warnings for now */
+        /* Recommended Count Per Op = 1, this seems to break very easily */
+        return (length * 63) / 25;
+    }
     else {
         DebugMessage(M64MSG_ERROR, "Unknown DD dma read dram=%08x  cart=%08x length=%08x",
             dram_addr, cart_addr, length);
-        return (length * 63) / 50;
+
+        /* Recommended Count Per Op = 1, this seems to break very easily */
+        return (length * 63) / 25;
     }
 
     for (i = 0; i < length; ++i) {
         mem[(cart_addr + i) ^ S8] = dram[(dram_addr + i) ^ S8];
     }
 
-    return (length * 63) / 50;
+    /* Recommended Count Per Op = 1, this seems to break very easily */
+    return (length * 63) / 25;
 }
 
 unsigned int dd_dom_dma_write(void* opaque, uint8_t* dram, uint32_t dram_addr, uint32_t cart_addr, uint32_t length)
@@ -640,8 +835,8 @@ unsigned int dd_dom_dma_write(void* opaque, uint8_t* dram, uint32_t dram_addr, u
     const uint8_t* mem;
     size_t i;
 
-    DebugMessage(M64MSG_VERBOSE, "DD DMA write dram=%08x  cart=%08x length=%08x",
-            dram_addr, cart_addr, length);
+    //DebugMessage(M64MSG_VERBOSE, "DD DMA write dram=%08x  cart=%08x length=%08x",
+    //        dram_addr, cart_addr, length);
 
     if (cart_addr < MM_DD_ROM) {
         if (cart_addr == MM_DD_C2S_BUFFER) {
@@ -658,16 +853,20 @@ unsigned int dd_dom_dma_write(void* opaque, uint8_t* dram, uint32_t dram_addr, u
             DebugMessage(M64MSG_ERROR, "Unknown DD dma write dram=%08x  cart=%08x length=%08x",
                 dram_addr, cart_addr, length);
 
-            return (length * 63) / 50;
+            /* Recommended Count Per Op = 1, this seems to break very easily */
+            return (length * 63) / 25;
         }
 
-        cycles = (length * 63) / 50;
+        /* Recommended Count Per Op = 1, this seems to break very easily */
+        cycles = (length * 63) / 25;
     }
     else {
         /* DD ROM */
         cart_addr = (cart_addr - MM_DD_ROM);
         mem = (const uint8_t*)dd->rom;
-        cycles = (length * 63) / 50;
+
+        /* Recommended Count Per Op = 1, this seems to break very easily */
+        cycles = (length * 63) / 25;
     }
 
     for (i = 0; i < length; ++i) {
@@ -680,246 +879,3 @@ unsigned int dd_dom_dma_write(void* opaque, uint8_t* dram, uint32_t dram_addr, u
     return cycles;
 }
 
-void dd_on_pi_cart_addr_write(struct dd_controller* dd, uint32_t address)
-{
-    /* clear C2 xfer */
-    if (address == MM_DD_C2S_BUFFER) {
-        dd->regs[DD_ASIC_CMD_STATUS] &= ~(DD_STATUS_C2_XFER | DD_STATUS_BM_ERR);
-        clear_dd_interrupt(dd, DD_STATUS_BM_INT);
-    }
-    /* clear data RQ */
-    else if (address == MM_DD_DS_BUFFER) {
-        dd->regs[DD_ASIC_CMD_STATUS] &= ~(DD_STATUS_DATA_RQ | DD_STATUS_BM_ERR);
-        clear_dd_interrupt(dd, DD_STATUS_BM_INT);
-    }
-}
-
-
-/* Disk conversion routines */
-void dd_convert_to_mame(unsigned char* mame_disk, const unsigned char* sdk_disk)
-{
-    /* Original code by Happy_ */
-    uint8_t system_data[DD_DISK_SYSTEM_DATA_SIZE];
-    uint8_t block_data[2][0x100 * SECTORS_PER_BLOCK];
-
-    uint32_t disktype = 0;
-    uint32_t zone, track = 0;
-    int32_t atrack = 0;
-    int32_t block = 0;
-    uint32_t InOffset, OutOffset = 0;
-    uint32_t InStart[16];
-    uint32_t OutStart[16];
-
-    int cur_offset = 0;
-
-
-    /* Read System Area */
-    memcpy(system_data, sdk_disk, DD_DISK_SYSTEM_DATA_SIZE);
-    disktype = system_data[5] & 0xf;
-
-    /* Prepare Input Offsets */
-    InStart[0] = 0;
-    for (zone = 1; zone < 16; ++zone) {
-        InStart[zone] = InStart[zone - 1] + VZONESIZE(DiskTypeZones[disktype][zone - 1]);
-    }
-
-    /* Prepare Output Offsets */
-    OutStart[0] = 0;
-    for (zone = 1; zone < 16; ++zone) {
-        OutStart[zone] = OutStart[zone - 1] + ZONESIZE(zone - 1);
-    }
-
-    /* Copy Head 0 */
-    for (zone = 0; zone < 8; zone++)
-    {
-        OutOffset = OutStart[zone];
-        InOffset = InStart[RevDiskTypeZones[disktype][zone]];
-        cur_offset = InOffset;
-
-        block = StartBlock[disktype][zone];
-        atrack = 0;
-        for (track = 0; track < ZoneTracks[zone]; track++)
-        {
-            if (atrack < 0xC && track == system_data[0x20 + zone * 0xC + atrack])
-            {
-                memset((void *)(&block_data[0]), 0, BLOCKSIZE(zone));
-                memset((void *)(&block_data[1]), 0, BLOCKSIZE(zone));
-                atrack += 1;
-            }
-            else
-            {
-                if ((block % 2) == 1)
-                {
-                    memcpy(block_data[1], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                    memcpy(block_data[0], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                }
-                else
-                {
-                    memcpy(block_data[0], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                    memcpy(block_data[1], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                }
-                block = 1 - block;
-            }
-            memcpy(mame_disk + OutOffset, &block_data[0], BLOCKSIZE(zone));
-            OutOffset += BLOCKSIZE(zone);
-            memcpy(mame_disk + OutOffset, &block_data[1], BLOCKSIZE(zone));
-            OutOffset += BLOCKSIZE(zone);
-        }
-    }
-
-    /* Copy Head 1 */
-    for (zone = 8; zone < 16; zone++)
-    {
-        InOffset = InStart[RevDiskTypeZones[disktype][zone]];
-        cur_offset = InOffset;
-
-        block = StartBlock[disktype][zone];
-        atrack = 0xB;
-        for (track = 1; track < ZoneTracks[zone] + 1; track++)
-        {
-            if (atrack > -1 && (ZoneTracks[zone] - track) == system_data[0x20 + (zone)* 0xC + atrack])
-            {
-                memset((void *)(&block_data[0]), 0, BLOCKSIZE(zone));
-                memset((void *)(&block_data[1]), 0, BLOCKSIZE(zone));
-                atrack -= 1;
-            }
-            else
-            {
-                if ((block % 2) == 1)
-                {
-                    memcpy(block_data[1], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                    memcpy(block_data[0], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                }
-                else
-                {
-                    memcpy(block_data[0], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                    memcpy(block_data[1], sdk_disk + cur_offset, BLOCKSIZE(zone));
-                    cur_offset += BLOCKSIZE(zone);
-                }
-                block = 1 - block;
-            }
-            OutOffset = OutStart[zone] + (ZoneTracks[zone] - track) * TRACKSIZE(zone);
-            memcpy(mame_disk + OutOffset, &block_data[0], BLOCKSIZE(zone));
-            OutOffset += BLOCKSIZE(zone);
-            memcpy(mame_disk + OutOffset, &block_data[1], BLOCKSIZE(zone));
-            OutOffset += BLOCKSIZE(zone);
-        }
-    }
-}
-
-void dd_convert_to_sdk(const unsigned char* mame_disk, unsigned char* sdk_disk)
-{
-    /* Original code by Happy_ */
-    uint8_t system_data[DD_DISK_SYSTEM_DATA_SIZE];
-    uint8_t block_data[2][0x100 * SECTORS_PER_BLOCK];
-
-    uint32_t disktype = 0;
-    uint32_t zone, track = 0;
-    int32_t atrack = 0;
-    int32_t block = 0;
-    uint32_t InOffset, OutOffset = 0;
-    uint32_t InStart[16];
-    uint32_t OutStart[16];
-
-
-    /* Read System Area */
-    memcpy(system_data, mame_disk, DD_DISK_SYSTEM_DATA_SIZE);
-    disktype = system_data[5] & 0xf;
-
-    /* Prepare Input Offsets */
-    InStart[0] = 0;
-    for (zone = 1; zone < 16; ++zone) {
-        InStart[zone] = InStart[zone - 1] + VZONESIZE(DiskTypeZones[disktype][zone - 1]);
-    }
-
-    /* Prepare Output Offsets */
-    OutStart[0] = 0;
-    for (zone = 1; zone < 16; ++zone) {
-        OutStart[zone] = OutStart[zone - 1] + ZONESIZE(zone - 1);
-    }
-
-    /* Copy Head 0 */
-    for (zone = 0; zone < 8; zone++)
-    {
-        block = StartBlock[disktype][zone];
-        atrack = 0;
-        for (track = 0; track < ZoneTracks[zone]; track++)
-        {
-            InOffset = OutStart[zone] + (track)* TRACKSIZE(zone);
-            OutOffset = InStart[RevDiskTypeZones[disktype][zone]] + (track - atrack) * TRACKSIZE(zone);
-
-            if (atrack < 0xC && track == system_data[0x20 + zone * 0xC + atrack])
-            {
-                atrack += 1;
-            }
-            else
-            {
-                if ((block % 2) == 1)
-                {
-                    memcpy(&block_data[1], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                    memcpy(&block_data[0], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                }
-                else
-                {
-                    memcpy(&block_data[0], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                    memcpy(&block_data[1], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                }
-                block = 1 - block;
-                memcpy(sdk_disk + OutOffset, &block_data[0], BLOCKSIZE(zone));
-                OutOffset += BLOCKSIZE(zone);
-                memcpy(sdk_disk + OutOffset, &block_data[1], BLOCKSIZE(zone));
-                OutOffset += BLOCKSIZE(zone);
-            }
-        }
-    }
-
-    /* Copy Head 1 */
-    for (zone = 8; zone < 16; zone++)
-    {
-        block = StartBlock[disktype][zone];
-        atrack = 0xB;
-        for (track = 1; track < ZoneTracks[zone] + 1; track++)
-        {
-            InOffset = OutStart[zone] + (ZoneTracks[zone] - track) * TRACKSIZE(zone);
-            OutOffset = InStart[RevDiskTypeZones[disktype][zone]] + (track - (0xB - atrack) - 1) * TRACKSIZE(zone);
-
-            if (atrack > -1 && (ZoneTracks[zone] - track) == system_data[0x20 + (zone)* 0xC + atrack])
-            {
-                atrack -= 1;
-            }
-            else
-            {
-                if ((block % 2) == 1)
-                {
-                    memcpy(&block_data[1], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                    memcpy(&block_data[0], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                }
-                else
-                {
-                    memcpy(&block_data[0], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                    memcpy(&block_data[1], mame_disk + InOffset, BLOCKSIZE(zone));
-                    InOffset += BLOCKSIZE(zone);
-                }
-                block = 1 - block;
-                memcpy(sdk_disk + OutOffset, &block_data[0], BLOCKSIZE(zone));
-                OutOffset += BLOCKSIZE(zone);
-                memcpy(sdk_disk + OutOffset, &block_data[1], BLOCKSIZE(zone));
-                OutOffset += BLOCKSIZE(zone);
-            }
-        }
-    }
-}

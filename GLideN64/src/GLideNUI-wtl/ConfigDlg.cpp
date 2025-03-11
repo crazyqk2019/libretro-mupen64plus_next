@@ -9,7 +9,7 @@
 #include "config-texture.h"
 #include "config-osd.h"
 #include "config-debug.h"
-#include "util.h"
+#include "util/util.h"
 #include "InputDialog.h"
 #include "Language.h"
 
@@ -35,6 +35,24 @@ void CConfigDlg::setIniPath(const std::string & IniPath) {
 
 void CConfigDlg::setRomName(const char * RomName) {
 	m_romName = RomName == NULL || strlen(RomName) == 0 ? NULL : RomName;
+}
+
+void CConfigDlg::setMSAALevel(uint32_t _maxMSAALevel) {
+	m_maxMSAALevel = _maxMSAALevel;
+}
+
+uint32_t CConfigDlg::getMSAALevel() const {
+	return m_maxMSAALevel;
+}
+
+void CConfigDlg::setMaxAnisotropy(uint32_t _maxAnisotropy)
+{
+	m_maxAnisotropy = _maxAnisotropy;
+}
+
+uint32_t CConfigDlg::getMaxAnisotropy() const
+{
+	return m_maxAnisotropy;
 }
 
 LRESULT CConfigDlg::OnInitDialog(UINT /*uMsg*/, WPARAM /*wParam*/, LPARAM /*lParam*/, BOOL& /*bHandled*/) {
@@ -221,12 +239,12 @@ void CConfigDlg::SaveSettings() {
 	m_Saved = true;
 	for (size_t i = 0; i < m_TabWindows.size(); i++)
 		m_TabWindows[i]->SaveSettings();
-    
+
 	if (config.generalEmulation.enableCustomSettings && CButton(GetDlgItem(IDC_GAME_PROFILE)).GetCheck() == BST_CHECKED && m_romName != nullptr)
 		saveCustomRomSettings(m_strIniPath.c_str(), m_romName);
     else
         writeSettings(m_strIniPath.c_str());
-    
+	Init(true);
 }
 
 LRESULT CConfigDlg::OnRestoreDefaults(WORD /*wNotifyCode*/, WORD /*wID*/, HWND /*hWndCtl*/, BOOL& /*bHandled*/) {
@@ -390,7 +408,7 @@ void CConfigDlg::SetLanguage(const std::string & language) {
 			m_Tabs.SetItem(i, &tci);
 		}
 	}
-	for (size_t i = 0; i < m_TabWindows.size(); i++) 
+	for (size_t i = 0; i < m_TabWindows.size(); i++)
 		m_TabWindows[i]->ApplyLanguage();
 	ApplyLanguage();
 }

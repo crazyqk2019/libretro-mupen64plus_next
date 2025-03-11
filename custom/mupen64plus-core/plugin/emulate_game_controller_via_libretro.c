@@ -73,7 +73,7 @@ void inputGetKeys_default( int Control, BUTTONS *Keys );
 typedef void (*get_keys_t)(int, BUTTONS*);
 static get_keys_t getKeys = inputGetKeys_default;
 
-static void inputGetKeys_default_descriptor(void)
+void inputGetKeys_default_descriptor(void)
 {
    if (alternate_mapping)
    {
@@ -405,6 +405,8 @@ EXPORT void CALL inputInitiateControllers(CONTROL_INFO ControlInfo)
           controller[i].control->Plugin = PLUGIN_MEMPAK;
        else if (pad_pak_types[i] == PLUGIN_RAW)
           controller[i].control->Plugin = PLUGIN_RAW;
+       else if (pad_pak_types[i] == PLUGIN_TRANSFER_PAK)
+          controller[i].control->Plugin = PLUGIN_TRANSFER_PAK;
        else
           controller[i].control->Plugin = PLUGIN_NONE;
     }

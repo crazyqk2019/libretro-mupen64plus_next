@@ -62,7 +62,7 @@ enum { GB_CART_FINGERPRINT_OFFSET = 0x134 };
 enum { DD_DISK_ID_OFFSET = 0x43670 };
 
 static const char* savestate_magic = "M64+SAVE";
-static const int savestate_latest_version = 0x00010600;  /* 1.6 */
+static const int savestate_latest_version = 0x00010900;  /* 1.9 */
 static const unsigned char pj64_magic[4] = { 0xC8, 0xA6, 0xD8, 0x23 };
 
 static savestates_job job = savestates_job_nothing;
@@ -100,31 +100,32 @@ static char *savestates_generate_path(savestates_type type)
     }
     else /* Use the selected savestate slot */
     {
-        char *filename;
+        char *filepath;
+        size_t size = 0;
+
         switch (type)
         {
             case savestates_type_m64p:
-                filename = formatstr("%s.st%d", ROM_SETTINGS.goodname, slot);
+                /* check if old file path exists, if it does then use that */
+                filepath = formatstr("%s%s.st%d", get_savestatepath(), ROM_SETTINGS.goodname, slot);
+                if (get_file_size(filepath, &size) != file_ok || size == 0)
+                {
+                    /* else use new path */
+                    filepath = formatstr("%s%s.st%d", get_savestatepath(), get_savestatefilename(), slot);
+                }
                 break;
             case savestates_type_pj64_zip:
-                filename = formatstr("%s.pj%d.zip", ROM_PARAMS.headername, slot);
+                filepath = formatstr("%s%s.pj%d.zip", get_savestatepath(), ROM_PARAMS.headername, slot);
                 break;
             case savestates_type_pj64_unc:
-                filename = formatstr("%s.pj%d", ROM_PARAMS.headername, slot);
+                filepath = formatstr("%s%s.pj%d", get_savestatepath(), ROM_PARAMS.headername, slot);
                 break;
             default:
-                filename = NULL;
+                filepath = NULL;
                 break;
         }
 
-        if (filename != NULL)
-        {
-            char *filepath = formatstr("%s%s", get_savestatepath(), filename);
-            free(filename);
-            return filepath;
-        }
-        else
-            return NULL;
+        return filepath;
     }
 }
 
@@ -155,6 +156,7 @@ void savestates_inc_slot(void)
 {
     if(++slot>9)
         slot = 0;
+    ConfigSetParameter(g_CoreConfig, "CurrentStateSlot", M64TYPE_INT, &slot);
     StateChanged(M64CORE_SAVESTATE_SLOT, slot);
 }
 
@@ -220,7 +222,6 @@ int savestates_load_m64p(struct device* dev, const void *data)
     char queue[1024];
     unsigned char using_tlb_data[4];
     unsigned char data_0001_0200[4096]; // 4k for extra state from v1.2
-    uint64_t flashram_status;
 
     uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
 
@@ -517,12 +518,9 @@ int savestates_load_m64p(struct device* dev, const void *data)
     COPYARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
     dev->cart.use_flashram = GETDATA(curr, int32_t);
-    dev->cart.flashram.mode = GETDATA(curr, int32_t);
-    flashram_status = GETDATA(curr, uint64_t);
-    dev->cart.flashram.status[0] = (uint32_t)(flashram_status >> 32);
-    dev->cart.flashram.status[1] = (uint32_t)(flashram_status);
-    dev->cart.flashram.erase_offset = GETDATA(curr, uint32_t);
-    dev->cart.flashram.write_pointer = GETDATA(curr, uint32_t);
+    curr += 4+8+4+4; /* Here there used to be flashram state */
+    /* by default, reset flashram state here and load it later if available */
+    poweron_flashram(&dev->cart.flashram);
 
     COPYARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
     COPYARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
@@ -639,8 +637,12 @@ int savestates_load_m64p(struct device* dev, const void *data)
             uint8_t rtc_regs[MBC3_RTC_REGS_COUNT];
             uint8_t rtc_latched_regs[MBC3_RTC_REGS_COUNT];
             uint8_t cam_regs[POCKET_CAM_REGS_COUNT];
-            unsigned int rom_bank, ram_bank, ram_enable, mbc1_mode, rtc_latch;
-            time_t rtc_last_time;
+            unsigned int rom_bank = 0;
+            unsigned int ram_bank = 0;
+            unsigned int ram_enable = 0;
+            unsigned int mbc1_mode = 0;
+            unsigned int rtc_latch = 0;
+            time_t rtc_last_time = 0;
 
             unsigned int enabled = ALIGNED_GETDATA(curr, uint32_t);
             unsigned int bank = ALIGNED_GETDATA(curr, uint32_t);
@@ -659,7 +661,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
                 COPYARRAY(cam_regs, curr, uint8_t, POCKET_CAM_REGS_COUNT);
             }
 
-            if (ROM_SETTINGS.transferpak && !Controls[i].RawData) {
+            if (ROM_SETTINGS.transferpak && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
 
                 /* init transferpak state if enabled and not controlled by input plugin */
                 dev->transferpaks[i].enabled = enabled;
@@ -769,7 +771,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
             uint8_t rpk_state = GETDATA(curr, uint8_t);
 
             /* init rumble pak state if enabled and not controlled by the input plugin */
-            if (ROM_SETTINGS.rumble && !Controls[i].RawData) {
+            if (ROM_SETTINGS.rumble && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
                 set_rumble_reg(&dev->rumblepaks[i], rpk_state);
             }
         }
@@ -780,8 +782,12 @@ int savestates_load_m64p(struct device* dev, const void *data)
             uint8_t rtc_regs[MBC3_RTC_REGS_COUNT];
             uint8_t rtc_latched_regs[MBC3_RTC_REGS_COUNT];
             uint8_t cam_regs[POCKET_CAM_REGS_COUNT];
-            unsigned int rom_bank, ram_bank, ram_enable, mbc1_mode, rtc_latch;
-            time_t rtc_last_time;
+            unsigned int rom_bank = 0;
+            unsigned int ram_bank = 0;
+            unsigned int ram_enable = 0;
+            unsigned int mbc1_mode = 0;
+            unsigned int rtc_latch = 0;
+            time_t rtc_last_time = 0;
 
             unsigned int enabled = GETDATA(curr, uint32_t);
             unsigned int bank = GETDATA(curr, uint32_t);
@@ -800,7 +806,7 @@ int savestates_load_m64p(struct device* dev, const void *data)
                 COPYARRAY(cam_regs, curr, uint8_t, POCKET_CAM_REGS_COUNT);
             }
 
-            if (ROM_SETTINGS.transferpak && !Controls[i].RawData) {
+            if (ROM_SETTINGS.transferpak && !Controls[i].RawData && (Controls[i].Type == CONT_TYPE_STANDARD)) {
 
                 /* init transferpak state if enabled and not controlled by input plugin */
                 dev->transferpaks[i].enabled = enabled;
@@ -917,9 +923,9 @@ int savestates_load_m64p(struct device* dev, const void *data)
                 dev->dd.rtc.last_update_rtc = (time_t)GETDATA(curr, int64_t);
                 dev->dd.bm_write = (unsigned char)GETDATA(curr, uint32_t);
                 dev->dd.bm_reset_held = (unsigned char)GETDATA(curr, uint32_t);
-                dev->dd.bm_block = (unsigned char)GETDATA(curr, uint32_t);
+                curr += sizeof(uint32_t); /* was bm_block */
                 dev->dd.bm_zone = GETDATA(curr, uint32_t);
-                dev->dd.bm_track_offset = GETDATA(curr, uint32_t);
+                curr += sizeof(uint32_t); /* was bm_track_offset */
             }
             else {
                 curr += (3+DD_ASIC_REGS_COUNT)*sizeof(uint32_t) + 0x100 + 0x40 + 2*sizeof(int64_t) + 2*sizeof(unsigned int);
@@ -933,6 +939,38 @@ int savestates_load_m64p(struct device* dev, const void *data)
 #else
             curr += sizeof(uint32_t);
 #endif
+        }
+
+        if (version >= 0x00010700)
+        {
+            dev->sp.fifo[0].dir = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].length = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].memaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[0].dramaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].dir = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].length = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].memaddr = GETDATA(curr, uint32_t);
+            dev->sp.fifo[1].dramaddr = GETDATA(curr, uint32_t);
+        }
+        else {
+            memset(dev->sp.fifo, 0, SP_DMA_FIFO_SIZE*sizeof(struct sp_dma));
+        }
+
+        if (version >= 0x00010800)
+        {
+            /* extra flashram state */
+            COPYARRAY(dev->cart.flashram.page_buf, curr, uint8_t, 128);
+            COPYARRAY(dev->cart.flashram.silicon_id, curr, uint32_t, 2);
+            dev->cart.flashram.status = GETDATA(curr, uint32_t);
+            dev->cart.flashram.erase_page = GETDATA(curr, uint16_t);
+            dev->cart.flashram.mode = GETDATA(curr, uint16_t);
+        }
+
+        if (version >= 0x00010900)
+        {
+            /* extra cp0 and cp2 state */
+            *r4300_cp0_latch(&dev->r4300.cp0) = GETDATA(curr, uint64_t);
+            *r4300_cp2_latch(&dev->r4300.cp2) = GETDATA(curr, uint64_t);
         }
     }
     else
@@ -957,10 +995,10 @@ int savestates_load_m64p(struct device* dev, const void *data)
 
             dev->controllers[i].flavor->reset(&dev->controllers[i]);
 
-            if (ROM_SETTINGS.rumble) {
+            if (ROM_SETTINGS.rumble && (Controls[i].Type == CONT_TYPE_STANDARD)) {
                 poweron_rumblepak(&dev->rumblepaks[i]);
             }
-            if (ROM_SETTINGS.transferpak) {
+            if (ROM_SETTINGS.transferpak && (Controls[i].Type == CONT_TYPE_STANDARD)) {
                 poweron_transferpak(&dev->transferpaks[i]);
             }
         }
@@ -1331,10 +1369,10 @@ static int savestates_load_pj64(struct device* dev,
 
         dev->controllers[i].flavor->reset(&dev->controllers[i]);
 
-        if (ROM_SETTINGS.rumble) {
+        if (ROM_SETTINGS.rumble && (Controls[i].Type == CONT_TYPE_STANDARD)) {
             poweron_rumblepak(&dev->rumblepaks[i]);
         }
-        if (ROM_SETTINGS.transferpak) {
+        if (ROM_SETTINGS.transferpak && (Controls[i].Type == CONT_TYPE_STANDARD)) {
             poweron_transferpak(&dev->transferpaks[i]);
         }
     }
@@ -1508,10 +1546,10 @@ int savestates_load(void)
             fPtr = fopen(filepath, "rb"); // can I open this?
         if (fPtr == NULL)
         {
+            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Failed to open savestate file %s", filepath);
             if (filepath != NULL)
                 free(filepath);
             filepath = NULL;
-            main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Failed to open savestate file %s", filepath);
         }
     }
     if (fPtr != NULL)
@@ -1567,6 +1605,7 @@ static void savestates_save_m64p_work(struct work_struct *work)
     {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", save->filepath);
         free(save->data);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return;
     }
 
@@ -1576,6 +1615,7 @@ static void savestates_save_m64p_work(struct work_struct *work)
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not write data to state file: %s", save->filepath);
         gzclose(f);
         free(save->data);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return;
     }
 
@@ -1593,6 +1633,7 @@ static void savestates_save_m64p_work(struct work_struct *work)
 #ifdef USE_SDL
     SDL_UnlockMutex(savestates_lock);
 #else
+    StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
     pthread_mutex_unlock(&savestates_lock);
 #endif
 }
@@ -1605,7 +1646,6 @@ int savestates_save_m64p(const struct device* dev, void *data)
 {
     unsigned char outbuf[4];
     int i;
-    uint64_t flashram_status;
 
     char queue[1024];
 
@@ -1618,6 +1658,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
     save = malloc(sizeof(*save));
     if (!save) {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return 0;
     }
 
@@ -1640,6 +1681,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
         free(save->filepath);
         free(save);
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to save state.");
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return 0;
     }
 
@@ -1801,11 +1843,7 @@ int savestates_save_m64p(const struct device* dev, void *data)
     PUTARRAY(dev->pif.ram, curr, uint8_t, PIF_RAM_SIZE);
 
     PUTDATA(curr, int32_t, dev->cart.use_flashram);
-    PUTDATA(curr, int32_t, dev->cart.flashram.mode);
-    flashram_status = ((uint64_t)dev->cart.flashram.status[0] << 32) | dev->cart.flashram.status[1];
-    PUTDATA(curr, uint64_t, flashram_status);
-    PUTDATA(curr, uint32_t, dev->cart.flashram.erase_offset);
-    PUTDATA(curr, uint32_t, dev->cart.flashram.write_pointer);
+    curr += 4+8+4+4; // Here used to be flashram state
 
     PUTARRAY(dev->r4300.cp0.tlb.LUT_r, curr, uint32_t, 0x100000);
     PUTARRAY(dev->r4300.cp0.tlb.LUT_w, curr, uint32_t, 0x100000);
@@ -1976,9 +2014,9 @@ int savestates_save_m64p(const struct device* dev, void *data)
         PUTDATA(curr, int64_t, (int64_t)dev->dd.rtc.last_update_rtc);
         PUTDATA(curr, uint32_t, dev->dd.bm_write);
         PUTDATA(curr, uint32_t, dev->dd.bm_reset_held);
-        PUTDATA(curr, uint32_t, dev->dd.bm_block);
+        PUTDATA(curr, uint32_t, 0); /* was bm_track_block */
         PUTDATA(curr, uint32_t, dev->dd.bm_zone);
-        PUTDATA(curr, uint32_t, dev->dd.bm_track_offset);
+        PUTDATA(curr, uint32_t, 0); /* was bm_track_offset */
     }
 
 #ifdef NEW_DYNAREC
@@ -1986,6 +2024,25 @@ int savestates_save_m64p(const struct device* dev, void *data)
 #else
     PUTDATA(curr, uint32_t, 0);
 #endif
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].dir);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].length);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].memaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[0].dramaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].dir);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].length);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].memaddr);
+    PUTDATA(curr, uint32_t, dev->sp.fifo[1].dramaddr);
+
+    /* extra flashram state (since 1.8) */
+    PUTARRAY(dev->cart.flashram.page_buf, curr, uint8_t, 128);
+    PUTARRAY(dev->cart.flashram.silicon_id, curr, uint32_t, 2);
+    PUTDATA(curr, uint32_t, dev->cart.flashram.status);
+    PUTDATA(curr, uint16_t, dev->cart.flashram.erase_page);
+    PUTDATA(curr, uint16_t, dev->cart.flashram.mode);
+
+    /* cp0 and cp2 latch (since 1.9) */
+    PUTDATA(curr, uint64_t, *r4300_cp0_latch((struct cp0*)&dev->r4300.cp0));
+    PUTDATA(curr, uint64_t, *r4300_cp2_latch((struct cp2*)&dev->r4300.cp2));
 
     init_work(&save->work, savestates_save_m64p_work);
     queue_work(&save->work);
@@ -2198,6 +2255,7 @@ static int savestates_save_pj64_zip(const struct device* dev, char *filepath)
             zipCloseFileInZip(zipfile); // This may fail, but we don't care
             zipClose(zipfile, "");
         }
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
         return 1;
 }
 
@@ -2214,17 +2272,20 @@ static int savestates_save_pj64_unc(const struct device* dev, char *filepath)
     if (f == NULL)
     {
         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not create PJ64 state file: %s", filepath);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return 0;
     }
 
     if (!savestates_save_pj64(dev, filepath, f, write_data_to_file))
     {
         fclose(f);
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
         return 0;
     }
 
     main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Saved state to: %s", namefrompath(filepath));
     fclose(f);
+    StateChanged(M64CORE_STATE_SAVECOMPLETE, 1);
     return 1;
 }
 
@@ -2256,9 +2317,13 @@ int savestates_save(void)
             case savestates_type_m64p: ret = savestates_save_m64p(dev, filepath); break;
             case savestates_type_pj64_zip: ret = savestates_save_pj64_zip(dev, filepath); break;
             case savestates_type_pj64_unc: ret = savestates_save_pj64_unc(dev, filepath); break;
-            default: ret = 0; break;
+            default: ret = 0; StateChanged(M64CORE_STATE_SAVECOMPLETE, ret); break;
         }
         free(filepath);
+    }
+    else
+    {
+        StateChanged(M64CORE_STATE_SAVECOMPLETE, ret);
     }
 #else
     if(fname)
@@ -2268,10 +2333,10 @@ int savestates_save(void)
     } else {
         ret = 0;
     }
-#endif // __LIBRETRO__
 
     // deliver callback to indicate completion of state saving operation
     StateChanged(M64CORE_STATE_SAVECOMPLETE, ret);
+#endif // __LIBRETRO__
 
     savestates_clear_job();
 

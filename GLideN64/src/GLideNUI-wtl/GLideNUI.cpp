@@ -15,8 +15,7 @@ Q_IMPORT_PLUGIN(QICOPlugin)
 
 //#define RUN_DIALOG_IN_THREAD
 
-static
-int openConfigDialog(const wchar_t * _strFileName, const char * _romName, bool & _accepted)
+static int openConfigDialog(const wchar_t * _strFileName, const wchar_t * _strSharedFileName, const char * _romName, unsigned int _maxMSAALevel, unsigned int _maxAnisotropy, bool & _accepted)
 {
 	std::string IniFolder;
 	uint32_t slength = WideCharToMultiByte(CP_ACP, 0, _strFileName, -1, NULL, 0, NULL, NULL);
@@ -33,26 +32,29 @@ int openConfigDialog(const wchar_t * _strFileName, const char * _romName, bool &
 	CConfigDlg Dlg;
 	Dlg.setIniPath(IniFolder.c_str());
 	Dlg.setRomName(_romName);
+	Dlg.setMSAALevel(_maxMSAALevel);
+	Dlg.setMaxAnisotropy(_maxAnisotropy);
 	Dlg.DoModal();
 	_accepted = Dlg.Saved();
 	return 0;
 }
 
-bool runConfigThread(const wchar_t * _strFileName, const char * _romName) {
+bool runConfigThread(const wchar_t * _strFileName, const wchar_t * _strSharedFileName, const char * _romName, unsigned int _maxMSAALevel, unsigned int _maxAnisotropy)
+{
 	bool accepted = false;
 #ifdef RUN_DIALOG_IN_THREAD
-	std::thread configThread(openConfigDialog, _strFileName, std::ref(accepted));
+	std::thread configThread(openConfigDialog, _strFileName, _maxMSAALevel, std::ref(accepted));
 	configThread.join();
 #else
-	openConfigDialog(_strFileName, _romName, accepted);
+    openConfigDialog(_strFileName, _strSharedFileName, _romName, _maxMSAALevel, _maxAnisotropy, accepted);
 #endif
 	return accepted;
 
 }
 
-EXPORT bool CALL RunConfig(const wchar_t * _strFileName, const char * _romName)
+EXPORT bool CALL RunConfig(const wchar_t * _strFileName, const wchar_t * _strSharedFileName, const char * _romName, unsigned int _maxMSAALevel, unsigned int _maxAnisotropy)
 {
-	return runConfigThread(_strFileName, _romName);
+    return runConfigThread(_strFileName, _strSharedFileName, _romName, _maxMSAALevel, _maxAnisotropy);
 }
 
 EXPORT int CALL RunAbout(const wchar_t * _strFileName)
@@ -70,7 +72,7 @@ EXPORT int CALL RunAbout(const wchar_t * _strFileName)
 	return 0;
 }
 
-EXPORT void CALL LoadConfig(const wchar_t * _strFileName)
+EXPORT void CALL LoadConfig(const wchar_t * _strFileName, const wchar_t * _strSharedFileName)
 {
 	std::string IniFolder;
 	uint32_t slength = WideCharToMultiByte(CP_ACP, 0, _strFileName, -1, NULL, 0, NULL, NULL);
@@ -81,7 +83,7 @@ EXPORT void CALL LoadConfig(const wchar_t * _strFileName)
 	loadSettings(IniFolder.c_str());
 }
 
-EXPORT void CALL LoadCustomRomSettings(const wchar_t * _strFileName, const char * _romName)
+EXPORT void CALL LoadCustomRomSettings(const wchar_t * _strFileName, const wchar_t * _strSharedFileName, const char * _romName)
 {
 	std::string IniFolder;
 	uint32_t slength = WideCharToMultiByte(CP_ACP, 0, _strFileName, -1, NULL, 0, NULL, NULL);

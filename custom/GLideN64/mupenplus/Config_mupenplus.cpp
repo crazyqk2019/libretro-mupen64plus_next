@@ -29,6 +29,10 @@ std::string replaceChars(std::string myString)
 	{
 		myString.replace(pos, 1, "%27");
 	}
+	for (size_t pos = myString.find('&'); pos != std::string::npos; pos = myString.find('&', pos))
+	{
+		myString.replace(pos, 1, "%26");
+	}
 	return myString;
 }
 
@@ -104,15 +108,21 @@ void LoadCustomSettings(bool internal)
 							config.frameBufferEmulation.N64DepthCompare = atoi(l.value);
 						}
 					}
+					else if (!strcmp(l.name, "frameBufferEmulation\\forceDepthBufferClear"))
+						config.frameBufferEmulation.forceDepthBufferClear = atoi(l.value);
 					else if (!strcmp(l.name, "frameBufferEmulation\\bufferSwapMode"))
 						config.frameBufferEmulation.bufferSwapMode = atoi(l.value);
 					else if (!strcmp(l.name, "texture\\bilinearMode"))
 						config.texture.bilinearMode = atoi(l.value);
+					else if (!strcmp(l.name, "texture\\enableHalosRemoval"))
+						config.texture.enableHalosRemoval = atoi(l.value);
 					else if (!strcmp(l.name, "texture\\maxAnisotropy"))
 						config.texture.maxAnisotropy = atoi(l.value);
-					else if (!strcmp(l.name, "generalEmulation\\enableNativeResTexrects"))
+					else if (!strcmp(l.name, "graphics2D\\enableNativeResTexrects"))
 						config.graphics2D.enableNativeResTexrects = atoi(l.value);
-					else if (!strcmp(l.name, "generalEmulation\\correctTexrectCoords"))
+					else if (!strcmp(l.name, "graphics2D\\enableTexCoordBounds"))
+						config.graphics2D.enableTexCoordBounds = atoi(l.value);
+					else if (!strcmp(l.name, "graphics2D\\correctTexrectCoords"))
 						config.graphics2D.correctTexrectCoords = atoi(l.value);
 					else if (!strcmp(l.name, "generalEmulation\\enableLegacyBlending"))
 						config.generalEmulation.enableLegacyBlending = atoi(l.value);
@@ -134,12 +144,21 @@ extern "C" void Config_LoadConfig()
 	u32 hacks = config.generalEmulation.hacks;
 	
 	config.resetToDefaults();
+
+	// Early
+	if(GLideN64IniBehaviour == 1)
+	{
+		LoadCustomSettings(true);
+		LoadCustomSettings(false);
+	}
+
 	config.frameBufferEmulation.aspect = AspectRatio;
 	config.frameBufferEmulation.enable = EnableFBEmulation;
 	config.frameBufferEmulation.N64DepthCompare = EnableN64DepthCompare;
 
 	config.texture.bilinearMode = bilinearMode;
 	config.generalEmulation.enableHybridFilter = EnableHybridFilter;
+	config.generalEmulation.enableInaccurateTextureCoordinates = EnableInaccurateTextureCoordinates;	
 	config.generalEmulation.enableDitheringPattern = EnableDitheringPattern;
 	config.generalEmulation.enableDitheringQuantization = EnableDitheringQuantization;
 	config.generalEmulation.rdramImageDitheringMode = RDRAMImageDitheringMode;
@@ -149,6 +168,7 @@ extern "C" void Config_LoadConfig()
 	
 	config.frameBufferEmulation.copyDepthToRDRAM = EnableCopyDepthToRDRAM;
 	config.frameBufferEmulation.copyToRDRAM = EnableCopyColorToRDRAM;
+	config.frameBufferEmulation.copyFromRDRAM = EnableCopyColorFromRDRAM;
 
 	// TODO: Make this a Core options or maybe only default to bsOnVerticalInterrupt on Android with Thr Renderer
 	config.frameBufferEmulation.bufferSwapMode = Config::bsOnVerticalInterrupt;
@@ -176,20 +196,21 @@ extern "C" void Config_LoadConfig()
 	config.video.fxaa = EnableFXAA;
 	config.video.multisampling = MultiSampling;
 	
-    // Overscan
-    config.frameBufferEmulation.enableOverscan = EnableOverscan;
-    // NTSC
-    config.frameBufferEmulation.overscanNTSC.left = OverscanLeft;
-    config.frameBufferEmulation.overscanNTSC.right = OverscanRight;
-    config.frameBufferEmulation.overscanNTSC.top = OverscanTop;
-    config.frameBufferEmulation.overscanNTSC.bottom = OverscanBottom;
-    // PAL
-    config.frameBufferEmulation.overscanPAL.left = OverscanLeft;
-    config.frameBufferEmulation.overscanPAL.right = OverscanRight;
-    config.frameBufferEmulation.overscanPAL.top = OverscanTop;
-    config.frameBufferEmulation.overscanPAL.bottom = OverscanBottom;
+	// Overscan
+	config.frameBufferEmulation.enableOverscan = EnableOverscan;
+	// NTSC
+	config.frameBufferEmulation.overscanNTSC.left = OverscanLeft;
+	config.frameBufferEmulation.overscanNTSC.right = OverscanRight;
+	config.frameBufferEmulation.overscanNTSC.top = OverscanTop;
+	config.frameBufferEmulation.overscanNTSC.bottom = OverscanBottom;
+	// PAL
+	config.frameBufferEmulation.overscanPAL.left = OverscanLeft;
+	config.frameBufferEmulation.overscanPAL.right = OverscanRight;
+	config.frameBufferEmulation.overscanPAL.top = OverscanTop;
+	config.frameBufferEmulation.overscanPAL.bottom = OverscanBottom;
 
 	config.graphics2D.correctTexrectCoords = CorrectTexrectCoords;
+	config.graphics2D.enableTexCoordBounds = EnableTexCoordBounds;
 	config.graphics2D.enableNativeResTexrects = enableNativeResTexrects;
 
 	config.graphics2D.bgMode = BackgroundMode;
@@ -197,9 +218,17 @@ extern "C" void Config_LoadConfig()
 	config.textureFilter.txEnhancedTextureFileStorage = EnableEnhancedTextureStorage;
 	config.textureFilter.txHresAltCRC = EnableHiResAltCRC;
 	config.textureFilter.txHiresTextureFileStorage = EnableEnhancedHighResStorage;
+	config.textureFilter.txHiresVramLimit = MaxHiResTxVramLimit;
 	config.frameBufferEmulation.nativeResFactor = EnableNativeResFactor;
 
 	config.generalEmulation.hacks = hacks;
-	LoadCustomSettings(true);
-	LoadCustomSettings(false);
+
+	// Late
+	if(GLideN64IniBehaviour == 0)
+	{
+		LoadCustomSettings(true);
+		LoadCustomSettings(false);
+	}
+
+	config.validate();
 }

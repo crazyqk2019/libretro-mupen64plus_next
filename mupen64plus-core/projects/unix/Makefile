@@ -1,4 +1,3 @@
-
 #/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
 # *   Mupen64plus - Makefile                                                *
 # *   Mupen64Plus homepage: https://mupen64plus.org/                        *
@@ -100,25 +99,30 @@ endif
 ifneq ("$(filter arm%,$(HOST_CPU))","")
   ifeq ("$(filter arm%b,$(HOST_CPU))","")
     CPU := ARM
-    ARCH_DETECTED := 32BITS
     PIC ?= 1
     NEW_DYNAREC := 1
-    CFLAGS += -marm
-    ifneq ("$(filter armv5%,$(HOST_CPU))","")
-        CFLAGS += -DARMv5_ONLY
-        $(warning Using ARMv5_ONLY)
-    endif
-    ifneq ("$(filter armv6%,$(HOST_CPU))","")
-        CFLAGS += -DARMv5_ONLY
-        $(warning Using ARMv5_ONLY)
-    endif
-    ifeq ($(NEON), 1)
-        CFLAGS += -mfpu=neon -mfloat-abi=hard
+    ifneq ("$(filter arm64,$(HOST_CPU))","")
+      ARCH_DETECTED := 64BITS
+      $(warning Architecture "$(HOST_CPU)" not officially supported.)
     else
-      ifeq ($(VFP_HARD), 1)
-        CFLAGS += -mfpu=vfp -mfloat-abi=hard
+      ARCH_DETECTED := 32BITS
+      CFLAGS += -marm
+      ifneq ("$(filter armv5%,$(HOST_CPU))","")
+          CFLAGS += -DARMv5_ONLY
+          $(warning Using ARMv5_ONLY)
+      endif
+      ifneq ("$(filter armv6%,$(HOST_CPU))","")
+          CFLAGS += -DARMv5_ONLY
+          $(warning Using ARMv5_ONLY)
+      endif
+      ifeq ($(NEON), 1)
+          CFLAGS += -mfpu=neon -mfloat-abi=hard
       else
-        CFLAGS += -mfpu=vfp -mfloat-abi=softfp
+        ifeq ($(VFP_HARD), 1)
+          CFLAGS += -mfpu=vfp -mfloat-abi=hard
+        else
+          CFLAGS += -mfpu=vfp -mfloat-abi=softfp
+        endif
       endif
     endif
   endif
@@ -136,21 +140,28 @@ ifneq ("$(filter aarch64,$(HOST_CPU))","")
     PIC ?= 1
     NEW_DYNAREC := 1
 endif
+ifneq ("$(filter riscv64,$(HOST_CPU))","")
+    CPU := RISCV64
+    ARCH_DETECTED := 64BITS
+    PIC ?= 1
+    NO_ASM := 1
+    $(warning Architecture "$(HOST_CPU)" not officially supported.)
+endif
 ifeq ("$(CPU)","NONE")
   $(error CPU type "$(HOST_CPU)" not supported.  Please file bug report at 'https://github.com/mupen64plus/mupen64plus-core/issues')
 endif
-
-# base CFLAGS, LDLIBS, and LDFLAGS
-OPTFLAGS ?= -O3 -flto
-WARNFLAGS ?= -Wall
-CFLAGS += -ffast-math -fno-strict-aliasing -fvisibility=hidden -I../../src -I../../src/asm_defines -DM64P_PARALLEL
-CXXFLAGS += -fvisibility-inlines-hidden
-LDLIBS +=  -lm
 
 # directory paths
 SRCDIR = ../../src
 OBJDIR = _obj$(POSTFIX)
 SUBDIR = ../../subprojects
+
+# base CFLAGS, LDLIBS, and LDFLAGS
+OPTFLAGS ?= -O3 -flto
+WARNFLAGS ?= -Wall
+CFLAGS += -fvisibility=hidden -I$(SRCDIR) -I$(SRCDIR)/asm_defines -DM64P_PARALLEL
+CXXFLAGS += -fvisibility-inlines-hidden
+LDLIBS +=  -lm
 
 # Since we are building a shared library, we must compile with -fPIC on some architectures
 # On 32-bit x86 systems we do not want to use -fPIC because we don't have to and it has a big performance penalty on this arch
@@ -169,9 +180,19 @@ ifeq ($(ARCH_DETECTED), 64BITS_32)
   ifeq ($(OS), FREEBSD)
     $(error Do not use the BITS=32 option with FreeBSD, use -m32 and -m elf_i386)
   endif
-  ifneq ($(OS),OSX)
-    CFLAGS += -m32
-    LDFLAGS += -Wl,-m,elf_i386
+  ifneq ($(OS), OSX)
+    ifeq ($(OS), MINGW)
+      LDFLAGS += -Wl,-m,i386pe
+    else
+      CFLAGS += -m32
+      LDFLAGS += -Wl,-m,elf_i386
+    endif
+  endif
+endif
+
+ifeq ($(ARCH_DETECTED), 64BITS)
+  ifeq ($(OS), MINGW)
+    LDFLAGS += -Wl,-m,i386pep
   endif
 endif
 
@@ -193,7 +214,7 @@ ifeq ($(OS), LINUX)
   LDFLAGS += -Wl,-Bsymbolic -shared -Wl,-export-dynamic -Wl,-soname,$(SONAME)
   LDLIBS += -ldl
   # only export api symbols
-  LDFLAGS += -Wl,-version-script,../../src/api/api_export.ver
+  LDFLAGS += -Wl,-version-script,$(SRCDIR)/api/api_export.ver
   ifeq ($(ARCH_DETECTED), 64BITS)
     ASFLAGS = -f elf64
   else
@@ -212,23 +233,33 @@ ifeq ($(OS), OSX)
     ASFLAGS = -f macho -d LEADING_UNDERSCORE
   endif
 
+  CXXFLAGS += '-stdlib=libc++'
   ifeq ($(CPU), X86)
     ifeq ($(ARCH_DETECTED), 64BITS)
-      CFLAGS += -pipe -arch x86_64 -mmacosx-version-min=10.6 -isysroot $(OSX_SDK_PATH)
+      CFLAGS += -pipe -arch x86_64 -mmacosx-version-min=10.9 -isysroot $(OSX_SDK_PATH)
     else
-      CFLAGS += -pipe -mmmx -msse -arch i686 -mmacosx-version-min=10.6 -isysroot $(OSX_SDK_PATH)
+      CFLAGS += -pipe -mmmx -msse -arch i686 -mmacosx-version-min=10.9 -isysroot $(OSX_SDK_PATH)
       ifneq ($(PROFILE), 1)
         CFLAGS += -fomit-frame-pointer
       endif
 	  LDFLAGS += -read_only_relocs suppress
     endif
   endif
+  ifeq ($(CPU), ARM)
+    # assembly compilation not yet supported on macOS with Apple Silicon
+    NO_ASM = 1
+    CFLAGS += -pipe -arch arm64 -mmacosx-version-min=10.16 -isysroot $(OSX_SDK_PATH)
+  endif
 endif
 ifeq ($(OS), MINGW)
   TARGET = mupen64plus$(POSTFIX).dll
-  LDFLAGS += -Wl,-Bsymbolic -shared -Wl,-export-all-symbols
-  # only export api symbols
-  LDFLAGS += -Wl,-version-script,../../src/api/api_export.ver
+  ifeq ($(CC), clang)
+    LDFLAGS += -shared -Wl,-export-all-symbols
+  else
+    LDFLAGS += -Wl,-Bsymbolic -shared -Wl,-export-all-symbols
+    # only export api symbols
+    LDFLAGS += -Wl,-version-script,$(SRCDIR)/api/api_export.ver
+  endif
   LDLIBS += -lpthread
   ifeq ($(ARCH_DETECTED), 64BITS)
     ASFLAGS = -f win64 -d WIN64
@@ -242,7 +273,7 @@ ifeq ($(PIC), 1)
 endif
 
 # assembler also needs base include directories
-ASFLAGS += -I../../src/ -I../../src/asm_defines/
+ASFLAGS += -I$(SRCDIR) -I$(SRCDIR)/asm_defines/
 
 ifeq ($(CPU_ENDIANNESS), BIG)
   CFLAGS += -DM64P_BIG_ENDIAN
@@ -320,17 +351,18 @@ endif
 
 # test for presence of SDL
 ifeq ($(origin SDL_CFLAGS) $(origin SDL_LDLIBS), undefined undefined)
-  SDL_CONFIG = $(CROSS_COMPILE)sdl2-config
-  ifeq ($(shell which $(SDL_CONFIG) 2>/dev/null),)
-    SDL_CONFIG = $(CROSS_COMPILE)sdl-config
-    ifeq ($(shell which $(SDL_CONFIG) 2>/dev/null),)
-      $(error No SDL development libraries found!)
-    else
-      $(warning Using SDL 1.2 libraries)
-    endif
+  ifeq ($(shell $(PKG_CONFIG) --modversion sdl2 2>/dev/null),)
+    $(error No SDL2 development libraries found!)
   endif
-  SDL_CFLAGS  += $(shell $(SDL_CONFIG) --cflags)
-  SDL_LDLIBS += $(shell $(SDL_CONFIG) --libs)
+  ifeq ($(NETPLAY), 1)
+    ifeq ($(shell $(PKG_CONFIG) --modversion SDL2_net 2>/dev/null),)
+      $(error No SDL2_net development libraries found!)
+    endif
+    SDL_CFLAGS += $(shell $(PKG_CONFIG) --cflags SDL2_net)
+    SDL_LDLIBS += $(shell $(PKG_CONFIG) --libs SDL2_net)
+  endif
+  SDL_CFLAGS += $(shell $(PKG_CONFIG) --cflags sdl2)
+  SDL_LDLIBS += $(shell $(PKG_CONFIG) --libs sdl2)
 endif
 CFLAGS += $(SDL_CFLAGS)
 LDLIBS += $(SDL_LDLIBS)
@@ -395,10 +427,26 @@ ifeq ($(OSD), 1)
   LDLIBS += $(GLU_LDLIBS)
 endif
 
+ifneq ($(OS), OSX)
+  ifneq ($(VULKAN), 0)
+    CFLAGS += -DVIDEXT_VULKAN
+
+    ifeq ($(origin VULKAN_CFLAGS) $(origin VULKAN_LDLIBS), undefined undefined)
+      ifeq ($(shell $(PKG_CONFIG) --modversion vulkan 2>/dev/null),)
+        $(error No Vulkan development libraries found!)
+      endif
+      VULKAN_CFLAGS += $(shell $(PKG_CONFIG) --cflags vulkan)
+      VULKAN_LDLIBS +=  $(shell $(PKG_CONFIG) --libs vulkan)
+    endif
+    CFLAGS += $(VULKAN_CFLAGS)
+    LDLIBS += $(VULKAN_LDLIBS)
+  endif
+endif
+
 # set base program pointers and flags
-CC        = $(CROSS_COMPILE)gcc
-CXX       = $(CROSS_COMPILE)g++
-STRINGS   = $(CROSS_COMPILE)strings
+CC       = $(CROSS_COMPILE)gcc
+CXX      = $(CROSS_COMPILE)g++
+STRINGS  = $(CROSS_COMPILE)strings
 AS        = nasm
 TR       ?= tr
 RM       ?= rm -f
@@ -433,7 +481,7 @@ ifeq ($(PROFILE), 1)
 else
   ifeq ($(DEBUG), 1)
     CFLAGS += -g
-    OPTFLAGS = -O0
+    OPTFLAGS = -Og
     INSTALL_STRIP_FLAG ?= 
   else
     CFLAGS += -DNDEBUG
@@ -497,13 +545,16 @@ SOURCE = \
     $(SRCDIR)/device/cart/cart_rom.c \
     $(SRCDIR)/device/cart/eeprom.c \
     $(SRCDIR)/device/cart/flashram.c \
+    $(SRCDIR)/device/cart/is_viewer.c \
     $(SRCDIR)/device/cart/sram.c \
     $(SRCDIR)/device/controllers/game_controller.c \
+    $(SRCDIR)/device/controllers/vru_controller.c \
     $(SRCDIR)/device/controllers/paks/biopak.c \
     $(SRCDIR)/device/controllers/paks/mempak.c \
     $(SRCDIR)/device/controllers/paks/rumblepak.c \
     $(SRCDIR)/device/controllers/paks/transferpak.c \
     $(SRCDIR)/device/dd/dd_controller.c \
+    $(SRCDIR)/device/dd/disk.c \
     $(SRCDIR)/device/device.c \
     $(SRCDIR)/device/gb/gb_cart.c \
     $(SRCDIR)/device/gb/mbc3_rtc.c \
@@ -516,6 +567,7 @@ SOURCE = \
     $(SRCDIR)/device/r4300/cached_interp.c \
     $(SRCDIR)/device/r4300/cp0.c \
     $(SRCDIR)/device/r4300/cp1.c \
+    $(SRCDIR)/device/r4300/cp2.c \
     $(SRCDIR)/device/r4300/idec.c \
     $(SRCDIR)/device/r4300/interrupt.c \
     $(SRCDIR)/device/r4300/pure_interp.c \
@@ -579,6 +631,12 @@ SOURCE += \
 # oglft
 SOURCE += $(SUBDIR)/oglft/OGLFT.cpp
 CXXFLAGS += -I$(SUBDIR)/oglft
+endif
+
+# netplay
+ifeq ($(NETPLAY), 1)
+CFLAGS += -DM64P_NETPLAY
+SOURCE += $(SRCDIR)/main/netplay.c
 endif
 
 # source files for optional features
@@ -650,6 +708,14 @@ ifeq ($(LIRC), 1)
   LDLIBS += -llirc_client
 endif
 
+ifeq ($(KEYBINDINGS), 0)
+	CFLAGS += -DNO_KEYBINDINGS
+endif
+
+ifeq ($(ACCURATE_FPU), 1)
+  CFLAGS += -DACCURATE_FPU_BEHAVIOR
+endif
+
 ifeq ($(DEBUGGER), 1)
   SOURCE += \
     $(SRCDIR)/debugger/dbg_debugger.c \
@@ -658,14 +724,18 @@ ifeq ($(DEBUGGER), 1)
     $(SRCDIR)/debugger/dbg_breakpoints.c
   LDLIBS += -lopcodes -lbfd
 
-  # UGLY libopcodes version check (we check for > 2.28)
+  # UGLY libopcodes/libbfd version check (we check for >= 2.28 and >= 2.39)
   LIBOPCODES_VERSION := $(shell $(STRINGS) --version | head -n1 | rev | cut -d ' ' -f1 | rev)
   LIBOPCODES_MAJOR := $(shell echo $(LIBOPCODES_VERSION) | cut -f1 -d.)
   LIBOPCODES_MINOR := $(shell echo $(LIBOPCODES_VERSION) | cut -f2 -d.)
-  LIBOPCODES_POINT := $(shell echo $(LIBOPCODES_VERSION) | cut -f3 -d.)
-  LIBOPCODES_GE_2_29 := $(shell [ $(LIBOPCODES_MAJOR) -gt 2 -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -ge 29 \) -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -eq 28 -a $(LIBOPCODES_POINT) -ge 1 \) ] && echo true)
+  LIBOPCODES_POINT := $(shell echo $(LIBOPCODES_VERSION) | cut -f3 -d. | sed 's/^$$/0/')
+  LIBOPCODES_GE_2_29 := $(shell [ $(LIBOPCODES_MAJOR) -gt 2 -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -ge 28 \) -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -eq 28 -a $(LIBOPCODES_POINT) -ge 1 \) ] && echo true)
+  LIBBFD_GE_2_39 := $(shell [ $(LIBOPCODES_MAJOR) -gt 2 -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -ge 39 \) -o \( $(LIBOPCODES_MAJOR) -eq 2 -a $(LIBOPCODES_MINOR) -eq 39 -a $(LIBOPCODES_POINT) -ge 1 \) ] && echo true)
   ifeq ($(LIBOPCODES_GE_2_29),true)
     CFLAGS += -DUSE_LIBOPCODES_GE_2_29
+  endif
+  ifeq ($(LIBBFD_GE_2_39),true)
+    CFLAGS += -DUSE_LIBBFD_GE_2_39
   endif
 endif
 
@@ -710,11 +780,15 @@ targets:
 	@echo "    WARNFLAGS=flag == compiler warning levels (default: -Wall)"
 	@echo "    PIC=(1|0)      == Force enable/disable of position independent code"
 	@echo "    OSD=(1|0)      == Enable/disable build of OpenGL On-screen display"
+	@echo "    NETPLAY=1      == Enable netplay functionality, requires SDL2_net"
 	@echo "    NEW_DYNAREC=1  == Replace dynamic recompiler with Ari64's experimental dynarec"
+	@echo "    KEYBINDINGS=0  == Disables the default keybindings"
+	@echo "    ACCURATE_FPU=1 == Enables accurate FPU behavior (i.e correct cause bits)"
 	@echo "    OPENCV=1       == Enable OpenCV support"
+	@echo "    VULKAN=0       == Disable vulkan support for the default video extension implementation"
 	@echo "    POSTFIX=name   == String added to the name of the the build (default: '')"
 	@echo "  Install Options:"
-	@echo "    PREFIX=path    == install/uninstall prefix (default: /usr/local/)"
+	@echo "    PREFIX=path    == install/uninstall prefix (default: /usr/local)"
 	@echo "    SHAREDIR=path  == path to install shared data files (default: PREFIX/share/mupen64plus)"
 	@echo "    LIBDIR=path    == path to install core library (default: PREFIX/lib)"
 	@echo "    INCDIR=path    == path to install core header files (default: PREFIX/include/mupen64plus)"
@@ -736,9 +810,9 @@ install: $(TARGET)
 	$(INSTALL) -d "$(DESTDIR)$(LIBDIR)"
 	$(INSTALL) -m 0644 $(INSTALL_STRIP_FLAG) $(TARGET) "$(DESTDIR)$(LIBDIR)"
 	$(INSTALL) -d "$(DESTDIR)$(SHAREDIR)"
-	$(INSTALL) -m 0644 ../../data/* "$(DESTDIR)$(SHAREDIR)"
+	$(INSTALL) -m 0644 $(SRCDIR)/../data/* "$(DESTDIR)$(SHAREDIR)"
 	$(INSTALL) -d "$(DESTDIR)$(INCDIR)"
-	$(INSTALL) -m 0644 ../../src/api/m64p_*.h "$(DESTDIR)$(INCDIR)"
+	$(INSTALL) -m 0644 $(SRCDIR)/api/m64p_*.h "$(DESTDIR)$(INCDIR)"
 	-$(LDCONFIG) "$(DESTDIR)$(LIBDIR)"
 	if [ ! -e "$(DESTDIR)$(LIBDIR)/$(SONAME)" ]; then ln -sf "$(TARGET)" "$(DESTDIR)$(LIBDIR)/$(SONAME)"; fi
 
@@ -751,7 +825,7 @@ uninstall:
 	$(RM) "$(DESTDIR)$(SHAREDIR)/mupencheat.txt"
 
 clean:
-	$(RM) -r $(TARGET) $(SONAME) $(OBJDIR) $(SRCDIR)/asm_defines/asm_defines_nasm.h $(SRCDIR)/asm_defines/asm_defines_gas.h
+	$(RM) -r _obj $(OBJDIR) $(TARGET) $(SONAME) $(SRCDIR)/asm_defines/asm_defines_*.h
 
 # build dependency files
 CFLAGS += -MD -MP
@@ -766,8 +840,8 @@ $(ASM_DEFINES_OBJ): $(SRCDIR)/asm_defines/asm_defines.c
 
 # Script hackery for generating ASM include files for the new dynarec assembly code
 $(SRCDIR)/asm_defines/asm_defines_gas.h: $(SRCDIR)/asm_defines/asm_defines_nasm.h
-$(SRCDIR)/asm_defines/asm_defines_nasm.h: $(ASM_DEFINES_OBJ) ../../tools/gen_asm_defines.awk
-	$(STRINGS) "$<" | $(TR) -d '\r' | $(AWK) -v dest_dir="$(SRCDIR)/asm_defines" -f ../../tools/gen_asm_defines.awk
+$(SRCDIR)/asm_defines/asm_defines_nasm.h: $(ASM_DEFINES_OBJ) $(SRCDIR)/../tools/gen_asm_script.sh
+	bash $(SRCDIR)/../tools/gen_asm_script.sh "$(SRCDIR)/asm_defines" "$(ASM_DEFINES_OBJ)"
 
 # standard build rules
 $(OBJDIR)/%.o: $(SRCDIR)/%.asm $(SRCDIR)/asm_defines/asm_defines_nasm.h

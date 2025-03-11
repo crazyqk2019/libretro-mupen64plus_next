@@ -571,7 +571,7 @@ inline u32 READ_RDP_DATA(u32 address)
 void RDP_ProcessRDPList()
 {
 	if (ConfigOpen || dwnd().isResizeWindow()) {
-		dp_start = dp_current = dp_end;
+		dp_current = dp_end;
 		gDPFullSync();
 		return;
 	}
@@ -606,6 +606,9 @@ void RDP_ProcessRDPList()
 		RDP.w2 = RDP.cmd_data[RDP.cmd_cur + 2];
 		RDP.w3 = RDP.cmd_data[RDP.cmd_cur + 3];
 		RSP.cmd = cmd;
+#ifdef DEBUG_DUMP
+		DebugMsg(DEBUG_LOW, "CMD=0x%02lX W0=0x%08lX W1=0x%08lX\n", cmd, RDP.w0, RDP.w1);
+#endif
 		LLETriangle::get().flush(cmd);
 		LLEcmd[cmd](RDP.w0, RDP.w1);
 
@@ -620,5 +623,5 @@ void RDP_ProcessRDPList()
 	gDP.changed |= CHANGED_COLORBUFFER;
 	gDP.changed &= ~CHANGED_CPU_FB_WRITE;
 
-	dp_start = dp_current = dp_end;
+	dp_current = dp_end;
 }

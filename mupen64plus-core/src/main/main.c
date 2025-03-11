@@ -55,6 +55,8 @@
 #include "backends/file_storage.h"
 #include "cheat.h"
 #include "device/device.h"
+#include "device/dd/disk.h"
+#include "device/controllers/vru_controller.h"
 #include "device/controllers/paks/biopak.h"
 #include "device/controllers/paks/mempak.h"
 #include "device/controllers/paks/rumblepak.h"
@@ -72,11 +74,18 @@
 #include "savestates.h"
 #include "screenshot.h"
 #include "util.h"
+#include "netplay.h"
 
 #include <libretro_private.h>
 #include <libco.h>
 
+#ifdef M64P_NETPLAY
+#undef SDL_GetTicks
+#include <SDL2/SDL.h>
+#endif // M64P_NETPLAY
+
 #ifdef HAVE_LIBNX
+#include <switch.h>
 #include <sys/stat.h>
 #endif
 
@@ -116,6 +125,8 @@ struct cheat_ctx g_cheat_ctx;
  */
 void* g_mem_base = NULL;
 
+uint32_t g_start_address = UINT32_C(0xa4000040);
+
 struct device g_dev;
 
 m64p_media_loader g_media_loader;
@@ -136,6 +147,9 @@ static void* l_paks[GAME_CONTROLLERS_COUNT][PAK_MAX_SIZE];
 static const struct pak_interface* l_ipaks[PAK_MAX_SIZE];
 static size_t l_pak_type_idx[6];
 
+/* PRNG state - used for Mempaks ID generation */
+struct xoshiro256pp_state l_mpk_idgen;
+
 /*********************************************************************************************************
 * static functions
 */
@@ -143,6 +157,30 @@ static size_t l_pak_type_idx[6];
 static const char *get_savepathdefault(const char *configpath)
 {
     return "";
+}
+
+static char *get_save_filename(void)
+{
+    static char filename[256];
+
+    int format = ConfigGetParamInt(g_CoreConfig, "SaveFilenameFormat");
+
+    if (format == 0) {
+        snprintf(filename, 256, "%s", ROM_PARAMS.headername);
+    } else /* if (format == 1) */ {
+        if (strstr(ROM_SETTINGS.goodname, "(unknown rom)") == NULL) {
+            snprintf(filename, 256, "%.32s-%.8s", ROM_SETTINGS.goodname, ROM_SETTINGS.MD5);
+        } else if (ROM_HEADER.Name[0] != 0) {
+            snprintf(filename, 256, "%s-%.8s", ROM_PARAMS.headername, ROM_SETTINGS.MD5);
+        } else {
+            snprintf(filename, 256, "unknown-%.8s", ROM_SETTINGS.MD5);
+        }
+    }
+
+    /* sanitize filename */
+    string_replace_chars(filename, ":<>\"/\\|?*", '_');
+
+    return filename;
 }
 
 static char *get_mempaks_path(void)
@@ -178,6 +216,25 @@ const char *get_savestatepath(void)
 const char *get_savesrampath(void)
 {
     return "";
+}
+
+const char *get_dd_disk_save_path(const char* diskname, int save_format)
+{
+    char* newPath = (char*)malloc(PATH_MAX);
+    strcpy(newPath, diskname);
+    
+    if(save_format == 0)
+        strcat(newPath, ".disk_save");
+    else
+        strcat(newPath, ".ram");
+
+    return newPath;
+}
+
+const char *get_savestatefilename(void)
+{
+    /* return same file name as save files */
+    return get_save_filename();
 }
 
 void main_message(m64p_msg_level level, unsigned int corner, const char *format, ...)
@@ -218,6 +275,9 @@ int main_set_core_defaults(void)
 
 void main_speeddown(int percent)
 {
+    if (netplay_is_init())
+        return;
+
     if (l_SpeedFactor - percent > 10)  /* 10% minimum speed */
     {
         l_SpeedFactor -= percent;
@@ -228,6 +288,9 @@ void main_speeddown(int percent)
 
 void main_speedup(int percent)
 {
+    if (netplay_is_init())
+        return;
+
     if (l_SpeedFactor + percent < 300) /* 300% maximum speed */
     {
         l_SpeedFactor += percent;
@@ -238,6 +301,9 @@ void main_speedup(int percent)
 
 static void main_speedset(int percent)
 {
+    if (netplay_is_init())
+        return;
+
     if (percent < 1 || percent > 1000)
     {
         DebugMessage(M64MSG_WARNING, "Invalid speed setting %i percent", percent);
@@ -253,6 +319,9 @@ static void main_speedset(int percent)
 
 void main_set_fastforward(int enable)
 {
+    if (netplay_is_init())
+        return;
+
     static int ff_state = 0;
     static int SavedSpeedFactor = 100;
 
@@ -276,8 +345,33 @@ void main_set_fastforward(int enable)
 
 static void main_set_speedlimiter(int enable)
 {
+    if (netplay_is_init() && !netplay_lag())
+        return;
+
     l_MainSpeedLimit = enable ? 1 : 0;
 }
+
+#if 0
+void main_speedlimiter_toggle(void)
+{
+    if (netplay_is_init())
+        return;
+
+    l_MainSpeedLimit = !l_MainSpeedLimit;
+    main_set_speedlimiter(l_MainSpeedLimit);
+
+    if (l_MainSpeedLimit) /* fix naturally occuring audio desync */
+    {
+        main_toggle_pause();
+        SDL_Delay(1000);
+        main_toggle_pause();
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Speed limiter enabled");
+    }
+
+    else
+        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Speed limiter disabled");
+}
+#endif
 
 static int main_is_paused(void)
 {
@@ -287,6 +381,9 @@ static int main_is_paused(void)
 void main_toggle_pause(void)
 {
     if (!g_EmulatorRunning)
+        return;
+
+    if (netplay_is_init())
         return;
 
     if (g_rom_pause)
@@ -341,6 +438,9 @@ void main_state_inc_slot(void)
 
 void main_state_load(const char *filename)
 {
+    if (netplay_is_init())
+        return;
+
     if (filename == NULL) // Save to slot
         savestates_set_job(savestates_job_load, savestates_type_m64p, NULL);
     else
@@ -349,6 +449,9 @@ void main_state_load(const char *filename)
 
 void main_state_save(int format, const char *filename)
 {
+    if (netplay_is_init())
+        return;
+
     if (filename == NULL) // Save to slot
         savestates_set_job(savestates_job_save, savestates_type_m64p, NULL);
     else // Save to file
@@ -401,6 +504,7 @@ m64p_error main_core_state_query(m64p_core_param param, int *rval)
             *rval = event_gameshark_active();
             break;
         // these are only used for callbacks; they cannot be queried or set
+        case M64CORE_SCREENSHOT_CAPTURED:
         case M64CORE_STATE_LOADCOMPLETE:
         case M64CORE_STATE_SAVECOMPLETE:
             return M64ERR_INPUT_INVALID;
@@ -590,11 +694,95 @@ void new_frame(void)
     }
 }
 
-#define SAMPLE_COUNT 3
+/*
+#define SAMPLE_COUNT 1
 static void apply_speed_limiter(void)
 {
-    return;
+    static unsigned long totalVIs = 0;
+    static int resetOnce = 0;
+    static int lastSpeedFactor = 100;
+    static unsigned int StartFPSTime = 0;
+    static const double defaultSpeedFactor = 100.0;
+#ifdef HAVE_LIBNX
+    unsigned int CurrentFPSTime = armTicksToNs(armGetSystemTick()) / 1000000;
+#else
+    unsigned int CurrentFPSTime = SDL_GetTicks();
+#endif // HAVE_LIBNX
+    static double sleepTimes[SAMPLE_COUNT];
+    static unsigned int sleepTimesIndex = 0;
+
+    // calculate frame duration based upon ROM setting (50/60hz) and mupen64plus speed adjustment
+    const double VILimitMilliseconds = 1000.0 / g_dev.vi.expected_refresh_rate;
+    const double SpeedFactorMultiple = defaultSpeedFactor/l_SpeedFactor;
+    const double AdjustedLimit = VILimitMilliseconds * SpeedFactorMultiple;
+    
+    //if this is the first time or we are resuming from pause
+    if(StartFPSTime == 0 || !resetOnce || lastSpeedFactor != l_SpeedFactor)
+    {
+       StartFPSTime = CurrentFPSTime;
+       totalVIs = 0;
+       resetOnce = 1;
+    }
+    else
+    {
+        ++totalVIs;
+    }
+
+    lastSpeedFactor = l_SpeedFactor;
+
+#if defined(PROFILE)
+    timed_section_start(TIMED_SECTION_IDLE);
+#endif
+
+#ifdef DBG
+    if(g_DebuggerActive) DebuggerCallback(DEBUG_UI_VI, 0);
+#endif
+
+    double totalElapsedGameTime = AdjustedLimit*totalVIs;
+    double elapsedRealTime = CurrentFPSTime - StartFPSTime;
+    double sleepTime = totalElapsedGameTime - elapsedRealTime;
+
+    //Reset if the sleep needed is an unreasonable value
+    static const double minSleepNeeded = -50;
+    static const double maxSleepNeeded = 50;
+    if(sleepTime < minSleepNeeded || sleepTime > (maxSleepNeeded*SpeedFactorMultiple))
+    {
+       resetOnce = 0;
+    }
+
+    sleepTimes[sleepTimesIndex%SAMPLE_COUNT] = sleepTime;
+    sleepTimesIndex++;
+
+    unsigned int elementsForAverage = sleepTimesIndex > SAMPLE_COUNT ? SAMPLE_COUNT : sleepTimesIndex;
+
+    // compute the average sleepTime
+    double sum = 0;
+    unsigned int index;
+    for(index = 0; index < elementsForAverage; index++)
+    {
+        sum += sleepTimes[index];
+    }
+
+    double averageSleep = sum/elementsForAverage;
+
+    int sleepMs = (int)averageSleep;
+
+    if(sleepMs > 0 && l_MainSpeedLimit)
+    {
+       //DebugMessage(M64MSG_VERBOSE, "    apply_speed_limiter(): Waiting %ims", sleepMs);
+#ifdef HAVE_LIBNX
+       svcSleepThread(sleepMs * 1000000);
+#else
+       SDL_Delay(sleepMs);
+#endif // HAVE_LIBNX
+    }
+
+
+#if defined(PROFILE)
+    timed_section_end(TIMED_SECTION_IDLE);
+#endif
 }
+*/
 
 /* TODO: make a GameShark module and move that there */
 static void gs_apply_cheats(struct cheat_ctx* ctx)
@@ -634,8 +822,10 @@ void new_vi(void)
 
     gs_apply_cheats(&g_cheat_ctx);
 
+    // apply_speed_limiter();
     main_check_inputs();
 
+    netplay_check_sync(&g_dev.r4300.cp0);
     retro_return();
 }
 
@@ -681,30 +871,80 @@ void save_storage_file_libretro(void* storage)
 
 static void open_mpk_file(struct file_storage* storage)
 {
-    storage->data = saved_memory.mempack;
-    storage->size = MEMPAK_SIZE * 4;
+    if (!netplay_is_init())
+    {
+        storage->data = saved_memory.mempack;
+        storage->size = MEMPAK_SIZE * 4;
+    }
+    else
+    {
+        // First we save them with what we have
+        storage->data = saved_memory.mempack;
+        storage->size = MEMPAK_SIZE * 4;
+        // If player 1 we send, otherwise we recieve
+        netplay_read_storage("mempak.mpk", storage->data, storage->size);
+    }
 }
 
 static void open_fla_file(struct file_storage* storage)
 {
-    storage->data = saved_memory.flashram;
-    storage->size = FLASHRAM_SIZE;
+    if (!netplay_is_init())
+    {
+        storage->data = saved_memory.flashram;
+        storage->size = FLASHRAM_SIZE;
+    }
+    else
+    {
+        // First we save them with what we have
+        storage->data = saved_memory.flashram;
+        storage->size = FLASHRAM_SIZE;
+        // If player 1 we send, otherwise we recieve
+        netplay_read_storage("flashram.fla", storage->data, storage->size);
+    }
 }
 
 static void open_sra_file(struct file_storage* storage)
 {
-    storage->data = saved_memory.sram;
-    storage->size = SRAM_SIZE;
+    if (!netplay_is_init())
+    {
+        storage->data = saved_memory.sram;
+        storage->size = SRAM_SIZE;
+    }
+    else
+    {
+        // First we save them with what we have
+        storage->data = saved_memory.sram;
+        storage->size = SRAM_SIZE;
+        // If player 1 we send, otherwise we recieve
+        netplay_read_storage("saveram.sra", storage->data, storage->size);
+    }
 }
 
 static void open_eep_file(struct file_storage* storage)
 {
-    storage->data = saved_memory.eeprom;
-    storage->size = EEPROM_MAX_SIZE;
+    if (!netplay_is_init())
+    {
+        storage->data = saved_memory.eeprom;
+        storage->size = EEPROM_MAX_SIZE;
+    }
+    else
+    {
+        // First we save them with what we have
+        storage->data = saved_memory.eeprom;
+        storage->size = EEPROM_MAX_SIZE;
+        // If player 1 we send, otherwise we recieve
+        netplay_read_storage("eeprom.eep", storage->data, storage->size);
+    }
 }
 
-static void load_dd_rom(uint8_t* rom, size_t* rom_size)
+static void load_dd_rom(uint8_t* rom, size_t* rom_size, uint8_t* disk_region)
 {
+    /* set the DD rom region */
+    if (g_media_loader.set_dd_rom_region != NULL)
+    {
+        g_media_loader.set_dd_rom_region(g_media_loader.cb_data, *disk_region);
+    }
+
     /* ask the core loader for DD disk filename */
     char* dd_ipl_rom_filename = (g_media_loader.get_dd_rom == NULL)
         ? NULL
@@ -715,9 +955,9 @@ static void load_dd_rom(uint8_t* rom, size_t* rom_size)
     char* pathname = (char*)malloc(2048);
     strncpy(pathname, sys_pathname, 2048 - 1);
     if (pathname[(strlen(pathname)-1)] != '/' && pathname[(strlen(pathname)-1)] != '\\')
-        strcat(pathname, path_default_slash());
+        strcat(pathname, PATH_DEFAULT_SLASH());
     strcat(pathname, "Mupen64plus");
-    strcat(pathname, path_default_slash());
+    strcat(pathname, PATH_DEFAULT_SLASH());
     strcat(pathname, "IPL.n64");
 
     if(retro_dd_path_img)
@@ -783,78 +1023,198 @@ no_dd:
     *rom_size = 0;
 }
 
-static void load_dd_disk(struct file_storage* dd_disk, const struct storage_backend_interface** dd_idisk)
+extern char* retro_dd_path_img;
+extern char* retro_dd_path_rom;
+static int load_dd_disk(struct dd_disk* dd_disk, const struct storage_backend_interface** dd_idisk)
 {
-    const char* format_desc;
     /* ask the core loader for DD disk filename */
     char* dd_disk_filename = (g_media_loader.get_dd_disk == NULL)
-        ? retro_dd_path_img
+        ? (retro_dd_path_img ? strdup(retro_dd_path_img) : NULL)
         : g_media_loader.get_dd_disk(g_media_loader.cb_data);
 
-    printf("Load DD disk %s\n", dd_disk_filename);
-    fflush(stdout);
+    //printf("Load DD disk %s\n", dd_disk_filename);
+    //fflush(stdout);
 
     /* handle the no disk case */
     if (dd_disk_filename == NULL || strlen(dd_disk_filename) == 0) {
         goto no_disk;
     }
 
-    /* open file */
-    if (open_rom_file_storage(dd_disk, dd_disk_filename) != file_ok) {
-        DebugMessage(M64MSG_ERROR, "Failed to load DD Disk: %s.", dd_disk_filename);
+    /* Get DD Disk size */
+    size_t dd_size = 0;
+    if (get_file_size(dd_disk_filename, &dd_size) != file_ok) {
+        DebugMessage(M64MSG_ERROR, "Can't get DD disk file size");
         goto no_disk;
     }
 
-    /* FIXME: handle byte swapping */
-
-
-    switch (dd_disk->size)
-    {
-    case MAME_FORMAT_DUMP_SIZE:
-        /* already in a compatible format */
-        *dd_idisk = &g_ifile_storage;
-        format_desc = "MAME";
-        break;
-
-    case SDK_FORMAT_DUMP_SIZE: {
-        /* convert to mame format */
-        uint8_t* buffer = malloc(MAME_FORMAT_DUMP_SIZE);
-        if (buffer == NULL) {
-            DebugMessage(M64MSG_ERROR, "Failed to allocate memory for MAME disk dump");
-            close_file_storage(dd_disk);
-            goto no_disk;
-        }
-
-        dd_convert_to_mame(buffer, dd_disk->data);
-        free(dd_disk->data);
-        dd_disk->data = buffer;
-        dd_disk->size = MAME_FORMAT_DUMP_SIZE;
-        *dd_idisk = &g_ifile_storage_dd_sdk_dump;
-        format_desc = "SDK";
-        } break;
-
-    default:
-        format_desc = "ERR";
-        DebugMessage(M64MSG_ERROR, "Invalid DD Disk size %u.", (uint32_t) dd_disk->size);
-        close_file_storage(dd_disk);
+    struct file_storage* fstorage = malloc(sizeof(struct file_storage));
+    struct file_storage* fstorage_save = malloc(sizeof(struct file_storage));
+    if (fstorage == NULL || fstorage_save == NULL) {
+        DebugMessage(M64MSG_ERROR, "Failed to allocate DD file_storage");
+        if (fstorage != NULL)      { free(fstorage);      fstorage = NULL; }
+        if (fstorage_save != NULL) { free(fstorage_save); fstorage_save = NULL; }
         goto no_disk;
+    }
+
+    /* Determine disk save format */
+    int save_format = 0; //ConfigGetParamInt(g_CoreConfig, "SaveDiskFormat");
+    /* MAME disks only support full disk save */
+    if (dd_size == MAME_FORMAT_DUMP_SIZE && save_format != 0) {
+        DebugMessage(M64MSG_WARNING, "MAME disks only support full disk save format, switching to full disk format !");
+        save_format = 0;
+    }
+
+    /* Determine save file name */
+    char* save_filename = get_dd_disk_save_path(dd_disk_filename, save_format);
+    if (save_filename == NULL) {
+        DebugMessage(M64MSG_ERROR, "Failed to get DD save path, DD will be read-only.");
+        save_format = -1;
+    }
+
+    /* Try loading *.{nd,d6}r file first (if SaveDiskFormat == 0) */
+    if (save_format == 0)
+    {
+        if (open_rom_file_storage(fstorage, save_filename) != file_ok) {
+            DebugMessage(M64MSG_WARNING, "Failed to load DD Disk save: %s.", save_filename);
+
+            /* Try loading regular disk file */
+            if (open_rom_file_storage(fstorage, dd_disk_filename) != file_ok) {
+                DebugMessage(M64MSG_ERROR, "Failed to load DD Disk: %s.", dd_disk_filename);
+                goto free_fstorage;
+            }
+        }
+    }
+    else
+    {
+        /* Try loading regular disk file */
+        if (open_rom_file_storage(fstorage, dd_disk_filename) != file_ok) {
+            DebugMessage(M64MSG_ERROR, "Failed to load DD Disk: %s.", dd_disk_filename);
+            goto free_fstorage;
+        }
+    }
+
+    /* Force fstorage to point to save_filename, to redirect all writes to save file,
+     * (and to avoid corrupting 64DD dump)
+     * save_filename is now owned by fstorage.
+     * dd_disk_filename is not owned anymore and must be freed individually.
+     */
+    fstorage->filename = save_filename;
+
+    /* Scan disk to deduce disk format and other parameters and expand its size for D64 */
+    unsigned int format = 0;
+    unsigned int development = 0;
+    size_t offset_sys = 0;
+    size_t offset_id = 0;
+    size_t offset_ram = 0;
+    size_t size_ram = 0;
+    uint8_t* new_data = scan_and_expand_disk_format(fstorage->data, fstorage->size, &format, &development, &offset_sys, &offset_id, &offset_ram, &size_ram);
+    if (new_data == NULL) {
+        DebugMessage(M64MSG_ERROR, "Wrong disk format");
+        goto wrong_disk_format;
+    }
+    else {
+        fstorage->data = new_data;
+    }
+
+    /* Load RAM save data (if SaveDiskFormat == 1) */
+    if (save_format == 1)
+    {
+        if (read_from_file(save_filename, &fstorage->data[offset_ram], size_ram) != file_ok)
+        {
+            DebugMessage(M64MSG_WARNING, "Failed to load DD Disk RAM area (*.ram): %s.", save_filename);
+        }
+    }
+
+    switch(save_format)
+    {
+    case 0: /* Full disk */
+        *dd_idisk = &g_istorage_disk_full;
+        fstorage_save->filename = save_filename;
+        fstorage_save->data = fstorage->data;
+        fstorage_save->size = fstorage->size;
+        fstorage_save->first_access = 1;
+        break;
+    case 1: /* RAM only */
+        *dd_idisk = &g_istorage_disk_ram_only;
+        fstorage_save->filename = save_filename;
+        fstorage_save->data = &fstorage->data[offset_ram];
+        fstorage_save->size = size_ram;
+        fstorage_save->first_access = 1;
+        break;
+    default: /* read only */
+        *dd_idisk = &g_istorage_disk_read_only;
+        free(fstorage_save);
+        fstorage_save = NULL;
+    }
+
+    /* Setup dd_disk */
+    dd_disk->storage = fstorage;
+    dd_disk->istorage = &g_ifile_storage_ro;
+    dd_disk->save_storage = fstorage_save;
+    dd_disk->isave_storage = (save_format >= 0) ? &g_ifile_storage : NULL;
+    dd_disk->format = format;
+    dd_disk->development = development;
+    dd_disk->region = DDREGION_UNKNOWN;
+    dd_disk->offset_sys = offset_sys;
+    dd_disk->offset_id = offset_id;
+    dd_disk->offset_ram = offset_ram;
+
+    /* Generate LBA conversion table */
+    GenerateLBAToPhysTable(dd_disk);
+
+    DebugMessage(M64MSG_INFO, "DD Disk: %s - %zu - %s",
+            dd_disk_filename,
+            (*dd_idisk)->size(dd_disk),
+            get_disk_format_name(format));
+
+    /* Get region from disk and byteswap it as needed */
+    uint32_t w = *(uint32_t*)(*dd_idisk)->data(dd_disk);
+    if (dd_disk->format == DISK_FORMAT_SDK) {
+        swap_buffer(&w, sizeof(w), 1);
     }
     
-    DebugMessage(M64MSG_INFO, "DD Disk: %s - %u - %s",
-            dd_disk->filename,
-            dd_disk->size,
-            format_desc);
-
-    uint32_t w = *(uint32_t*)dd_disk->data;
-    if (w == DD_REGION_JP || w == DD_REGION_US) {
-        DebugMessage(M64MSG_WARNING, "Loading a saved disk ");
+    /* Set region in dd_disk */
+    if (w == DD_REGION_DV || development) {
+        dd_disk->region = DDREGION_DEV;
+    } else if (w == DD_REGION_JP) {
+        dd_disk->region = DDREGION_JAPAN;
+    } else if (w == DD_REGION_US) {
+        dd_disk->region = DDREGION_US;
     }
 
-    return;
+    if (w == DD_REGION_JP || w == DD_REGION_US || w == DD_REGION_DV) {
+        DebugMessage(M64MSG_WARNING, "Loading a saved disk");
+    }
 
+    free(dd_disk_filename);
+    return 1;
+
+wrong_disk_format:
+    /* no need to close save_storage as it is a child of disk->storage */
+    close_file_storage(fstorage);
+free_fstorage:
+    free(fstorage);
+    free(fstorage_save);
 no_disk:
     free(dd_disk_filename);
     *dd_idisk = NULL;
+
+    return 0;
+}
+
+static void close_dd_disk(struct dd_disk* disk)
+{
+    if (disk->save_storage != NULL) {
+        /* no need to close save_storage as it is a child of disk->storage */
+        free(disk->save_storage);
+        disk->save_storage = NULL;
+    }
+
+    if (disk->storage != NULL) {
+        close_file_storage(disk->storage);
+        free(disk->storage);
+        disk->storage = NULL;
+    }
 }
 
 
@@ -875,7 +1235,7 @@ static void init_gb_rom(void* opaque, void** storage, const struct storage_backe
 
     /* Ask the core loader for rom filename */
     char* rom_filename = (g_media_loader.get_gb_cart_rom == NULL)
-        ? NULL
+        ? (retro_transferpak_rom_path ? strdup(retro_transferpak_rom_path) : NULL)
         : g_media_loader.get_gb_cart_rom(g_media_loader.cb_data, data->control_id);
 
     /* Handle the no cart case */
@@ -885,11 +1245,11 @@ static void init_gb_rom(void* opaque, void** storage, const struct storage_backe
 
     /* Open ROM file */
     if (open_rom_file_storage(&data->rom_fstorage, rom_filename) != file_ok) {
-        DebugMessage(M64MSG_ERROR, "Failed to load ROM file: %s", rom_filename);
+        log_cb(RETRO_LOG_ERROR, "Failed to load ROM file: %s\n", rom_filename);
         goto no_cart;
     }
 
-    DebugMessage(M64MSG_INFO, "GB Loader ROM: %s - %zu",
+    log_cb(RETRO_LOG_INFO, "GB Loader ROM: %s - %zu\n",
             data->rom_fstorage.filename,
             data->rom_fstorage.size);
 
@@ -919,7 +1279,7 @@ static void init_gb_ram(void* opaque, size_t ram_size, void** storage, const str
 
     /* Ask the core loader for ram filename */
     char* ram_filename = (g_media_loader.get_gb_cart_ram == NULL)
-        ? NULL
+        ? (retro_transferpak_ram_path ? strdup(retro_transferpak_ram_path) : NULL)
         : g_media_loader.get_gb_cart_ram(g_media_loader.cb_data, data->control_id);
 
     /* Handle the no RAM case
@@ -935,13 +1295,13 @@ static void init_gb_ram(void* opaque, size_t ram_size, void** storage, const str
     int err = open_file_storage(&data->ram_fstorage, ram_size, ram_filename);
     if (err == file_open_error) {
         memset(data->ram_fstorage.data, 0, data->ram_fstorage.size);
-        DebugMessage(M64MSG_INFO, "Providing default RAM content");
+        log_cb(RETRO_LOG_INFO, "Providing default RAM content\n");
     }
     else if (err == file_read_error) {
-        DebugMessage(M64MSG_WARNING, "Size mismatch between expected RAM size and effective file size");
+        log_cb(RETRO_LOG_WARN, "Size mismatch between expected RAM size and effective file size\n");
     }
 
-    DebugMessage(M64MSG_INFO, "GB Loader RAM: %s - %zu",
+    log_cb(RETRO_LOG_INFO, "GB Loader RAM: %s - %zu\n",
             data->ram_fstorage.filename,
             data->ram_fstorage.size);
 
@@ -984,10 +1344,10 @@ void main_change_gb_cart(int control_id)
 
     if (tpk->gb_cart != NULL) {
         const uint8_t* rom_data = gb_cart->irom_storage->data(gb_cart->rom_storage);
-        DebugMessage(M64MSG_INFO, "Inserting GB cart %s into transferpak %u", rom_data + 0x134, control_id);
+        log_cb(RETRO_LOG_INFO, "Inserting GB cart %s into transferpak %u\n", rom_data + 0x134, control_id);
     }
     else {
-        DebugMessage(M64MSG_INFO, "Removing GB cart from transferpak %u", control_id);
+        log_cb(RETRO_LOG_WARN, "Removing GB cart from transferpak %u\n", control_id);
     }
 }
 
@@ -1001,22 +1361,24 @@ extern input_plugin_functions dummy_input;
 extern audio_plugin_functions dummy_audio;
 
 unsigned int r4300_emumode;
-
-uint32_t rdram_size;
-struct file_storage eep;
-struct file_storage fla;
-struct file_storage sra;
-struct file_storage dd_disk;
-size_t dd_rom_size;
+size_t rdram_size;
 
 m64p_error main_run(void)
 {
     size_t i, k;
-    unsigned int count_per_op;
-    unsigned int disable_extra_mem;
-    int si_dma_duration;
-    int no_compiled_jump;
-    int randomize_interrupt;
+    uint32_t count_per_op;
+    uint32_t count_per_op_denom_pot;
+    uint32_t emumode;
+    uint32_t disable_extra_mem;
+    int32_t si_dma_duration;
+    int32_t no_compiled_jump;
+    int32_t randomize_interrupt;
+    struct file_storage eep;
+    struct file_storage fla;
+    struct file_storage sra;
+    size_t dd_rom_size;
+    struct dd_disk dd_disk;
+    m64p_error failure_rval;
     struct audio_out_backend_interface audio_out_backend_libretro;
 
     int control_ids[GAME_CONTROLLERS_COUNT];
@@ -1030,19 +1392,49 @@ m64p_error main_run(void)
 
     /* XXX: select type of flashram from db */
     uint32_t flashram_type = MX29L1100_ID;
-
+    
+    emumode = r4300_emumode;
+    randomize_interrupt = 0; // We don't want this right now
+    no_compiled_jump = 0;
     count_per_op = CountPerOp;
-    disable_extra_mem = ROM_PARAMS.disableextramem;
+    count_per_op_denom_pot = CountPerOpDenomPot;
+    disable_extra_mem = ROM_SETTINGS.disableextramem;
 
-    if (ForceDisableExtraMem == 1)
-        disable_extra_mem = 1;
+    uint16_t eeprom_type = JDT_NONE;
+    switch (ROM_SETTINGS.savetype) {
+        case SAVETYPE_EEPROM_4K:
+            eeprom_type = JDT_EEPROM_4K;
+            break;
+        case SAVETYPE_EEPROM_16K:
+            eeprom_type = JDT_EEPROM_16K;
+            break;
+    }
 
-    rdram_size = (disable_extra_mem == 0) ? 0x800000 : 0x400000;
+    /* Seed MPK ID gen using current time */
+    uint64_t mpk_seed = !netplay_is_init() ? (uint64_t)time(NULL) : 0;
+    l_mpk_idgen = xoshiro256pp_seed(mpk_seed);
+
+    no_compiled_jump = 0; //ConfigGetParamBool(g_CoreConfig, "NoCompiledJump");
+    //We disable any randomness for netplay
+    //randomize_interrupt = !netplay_is_init() ? ConfigGetParamBool(g_CoreConfig, "RandomizeInterrupt") : 0;
+
+    if (ROM_SETTINGS.disableextramem)
+        disable_extra_mem = ROM_SETTINGS.disableextramem;
+    else
+        disable_extra_mem = ForceDisableExtraMem;
 
     if (count_per_op <= 0)
-        count_per_op = ROM_PARAMS.countperop;
+        count_per_op = ROM_SETTINGS.countperop;
 
-    si_dma_duration = ROM_PARAMS.sidmaduration;
+    if (count_per_op_denom_pot > 20)
+        count_per_op_denom_pot = 20;
+
+    si_dma_duration = ROM_SETTINGS.sidmaduration;
+
+    //During netplay, player 1 is the source of truth for these settings
+    netplay_sync_settings(&count_per_op, &count_per_op_denom_pot, &disable_extra_mem, &si_dma_duration, &emumode, &no_compiled_jump);
+
+    rdram_size = (disable_extra_mem == 0) ? 0x800000 : 0x400000;
 
     cheat_add_hacks(&g_cheat_ctx, ROM_PARAMS.cheats);
 
@@ -1056,7 +1448,7 @@ m64p_error main_run(void)
 #endif
 
     /* setup backends */
-    extern void set_audio_format_via_libretro(void* user_data, unsigned int frequency, unsigned int bits);
+    extern void set_audio_format_via_libretro(void* user_data, unsigned int frequency);
     extern void push_audio_samples_via_libretro(void* user_data, const void* buffer, size_t size);
     audio_out_backend_libretro = (struct audio_out_backend_interface){ set_audio_format_via_libretro, push_audio_samples_via_libretro };
     
@@ -1106,10 +1498,22 @@ m64p_error main_run(void)
     const struct storage_backend_interface* dd_idisk = NULL;
     memset(&dd_disk, 0, sizeof(dd_disk));
 
-    load_dd_rom((uint8_t*)mem_base_u32(g_mem_base, MM_DD_ROM), &dd_rom_size);
-    if (dd_rom_size > 0) {
+    /* try to load DD disk first, if that succeeds, pass the region to load_dd_rom */
+    if (load_dd_disk(&dd_disk, &dd_idisk))
+    {
         dd_rtc_iclock = &g_iclock_ctime_plus_delta;
-        load_dd_disk(&dd_disk, &dd_idisk);
+        load_dd_rom((uint8_t*)mem_base_u32(g_mem_base, MM_DD_ROM), &dd_rom_size, &dd_disk.region);
+    }
+    else
+    {
+        dd_rom_size = 0;
+    }
+
+    /* ensure the 64DD rom & disk are loaded,
+     * otherwise we have to bail right now */
+    if (g_rom_size == 0 && dd_rom_size == 0)
+    {
+        goto on_disk_failure;
     }
 
     /* setup pif channel devices */
@@ -1120,14 +1524,39 @@ m64p_error main_run(void)
     memset(&l_gb_carts_data, 0, GAME_CONTROLLERS_COUNT*sizeof(*l_gb_carts_data));
     memset(cin_compats, 0, GAME_CONTROLLERS_COUNT*sizeof(*cin_compats));
 
+    netplay_read_registration(cin_compats);
+
     for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
 
-        control_ids[i] = (int)i;
+        //During netplay, we "trick" the input plugin
+        //by replacing the regular control_id with the ID that is controlling the player during netplay
+        control_ids[i] = netplay_is_init() ? netplay_get_controller(i) : (int)i;
 
         /* if input plugin requests RawData let the input plugin do the channel device processing */
         if (Controls[i].RawData) {
             joybus_devices[i] = &control_ids[i];
             ijoybus_devices[i] = &g_ijoybus_device_plugin_compat;
+        }
+        else if (Controls[i].Type == CONT_TYPE_VRU) {
+            const struct game_controller_flavor* cont_flavor =
+                &g_vru_controller_flavor;
+            joybus_devices[i] = &g_dev.controllers[i];
+            ijoybus_devices[i] = &g_ijoybus_vru_controller;
+
+            cin_compats[i].control_id = (int)i;
+            cin_compats[i].cont = &g_dev.controllers[i];
+            cin_compats[i].last_pak_type = Controls[i].Plugin;
+            cin_compats[i].last_input = 0;
+            cin_compats[i].netplay_count = 0;
+            cin_compats[i].event_first = NULL;
+
+            Controls[i].Plugin = PLUGIN_NONE;
+
+            /* init vru_controller */
+            init_game_controller(&g_dev.controllers[i],
+                    cont_flavor,
+                    &cin_compats[i], &g_icontroller_input_backend_plugin_compat,
+                    NULL, NULL);
         }
         /* otherwise let the core do the processing */
         else {
@@ -1145,6 +1574,9 @@ m64p_error main_run(void)
             cin_compats[i].cont = &g_dev.controllers[i];
             cin_compats[i].tpk = &g_dev.transferpaks[i];
             cin_compats[i].last_pak_type = Controls[i].Plugin;
+            cin_compats[i].last_input = 0;
+            cin_compats[i].netplay_count = 0;
+            cin_compats[i].event_first = NULL;
 
             l_gb_carts_data[i].control_id = (int)i;
 
@@ -1175,7 +1607,7 @@ m64p_error main_run(void)
                     mpk_storages[i].size = MEMPAK_SIZE;
                     mpk_storages[i].filename = (void*)&mpk; /* OK for isubfile_storage */
 
-                    init_mempak(&g_dev.mempaks[i], &mpk_storages[i], &g_isubfile_storage);
+                    init_mempak(&g_dev.mempaks[i], &mpk_storages[i], &g_ifile_storage_ro);
                     l_paks[i][k] = &g_dev.mempaks[i];
 
                     if (Controls[i].Plugin == PLUGIN_MEMPAK) {
@@ -1211,7 +1643,7 @@ m64p_error main_run(void)
                     }
 
                     /* enable GB cart switch */
-                    cin_compats[i].gb_cart_switch_enabled = 1;
+                    // cin_compats[i].gb_cart_switch_enabled = 1;
                 }
                 /* No Pak */
                 else {
@@ -1251,25 +1683,28 @@ m64p_error main_run(void)
                 g_mem_base,
                 r4300_emumode,
                 count_per_op,
+                count_per_op_denom_pot,
                 no_compiled_jump,
                 randomize_interrupt,
-                &g_dev.ai, &audio_out_backend_libretro,
+                g_start_address,
+                &g_dev.ai, &audio_out_backend_libretro, ((float)ROM_SETTINGS.aidmamodifier / 100.0),
                 si_dma_duration,
                 rdram_size,
                 joybus_devices, ijoybus_devices,
                 vi_clock_from_tv_standard(ROM_PARAMS.systemtype), vi_expected_refresh_rate_from_tv_standard(ROM_PARAMS.systemtype),
                 NULL, &g_iclock_ctime_plus_delta,
                 g_rom_size,
-                (ROM_SETTINGS.savetype != EEPROM_16KB) ? JDT_EEPROM_4K : JDT_EEPROM_16K,
-                &eep, &g_ifile_storage,
+                eeprom_type,
+                &eep, &g_ifile_storage_ro,
                 flashram_type,
-                &fla, &g_ifile_storage,
-                &sra, &g_ifile_storage,
+                &fla, &g_ifile_storage_ro,
+                &sra, &g_ifile_storage_ro,
                 NULL, dd_rtc_iclock,
                 dd_rom_size,
                 &dd_disk, dd_idisk);
 
     // Attach rom to plugins
+    failure_rval = M64ERR_PLUGIN_FAIL;
     if (!gfx.romOpen())
     {
         goto on_gfx_open_failure;
@@ -1296,7 +1731,7 @@ m64p_error main_run(void)
 
     /* release gb_carts */
     for(i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
-        if (!Controls[i].RawData && g_dev.gb_carts[i].read_gb_cart != NULL) {
+        if (!Controls[i].RawData  && (Controls[i].Type == CONT_TYPE_STANDARD) && g_dev.gb_carts[i].read_gb_cart != NULL) {
             release_gb_rom(&l_gb_carts_data[i]);
             release_gb_ram(&l_gb_carts_data[i]);
         }
@@ -1310,8 +1745,11 @@ m64p_error main_run(void)
     close_file_storage(&fla);
     close_file_storage(&eep);
     close_file_storage(&mpk);
-    close_file_storage(&dd_disk);
 #endif
+
+    /* reset pif */
+    close_pif();
+    close_dd_disk(&dd_disk);
 
     /* Emulation stopped */
     rsp.romClosed();
@@ -1337,6 +1775,10 @@ m64p_error main_run(void)
 
     return M64ERR_SUCCESS;
 
+on_disk_failure:
+    failure_rval = M64ERR_INVALID_STATE;
+    rsp.romClosed();
+    input.romClosed();
 on_input_open_failure:
     audio.romClosed();
 on_audio_open_failure:
@@ -1344,7 +1786,7 @@ on_audio_open_failure:
 on_gfx_open_failure:
     /* release gb_carts */
     for(i = 0; i < GAME_CONTROLLERS_COUNT; ++i) {
-        if (!Controls[i].RawData && g_dev.gb_carts[i].read_gb_cart != NULL) {
+        if (!Controls[i].RawData  && (Controls[i].Type == CONT_TYPE_STANDARD) && g_dev.gb_carts[i].read_gb_cart != NULL) {
             release_gb_rom(&l_gb_carts_data[i]);
             release_gb_ram(&l_gb_carts_data[i]);
         }
@@ -1359,10 +1801,13 @@ on_gfx_open_failure:
     close_file_storage(&fla);
     close_file_storage(&eep);
     close_file_storage(&mpk);
-    close_file_storage(&dd_disk);
+    close_dd_disk(&dd_disk);
 #endif
 
-    return M64ERR_PLUGIN_FAIL;
+    /* reset pif */
+    close_pif();
+
+    return failure_rval;
 }
 
 void main_stop(void)
@@ -1381,4 +1826,50 @@ void main_stop(void)
     }
 
     stop_device(&g_dev);
+}
+
+m64p_error open_pif(const unsigned char* pifimage, unsigned int size)
+{
+    md5_byte_t old_pif_ntsc_md5[] = {0x49, 0x21, 0xD5, 0xF2, 0x16, 0x5D, 0xEE, 0x6E, 0x24, 0x96, 0xF4, 0x38, 0x8C, 0x4C, 0x81, 0xDA};
+    md5_byte_t old_pif_pal_md5[]  = {0x2B, 0x6E, 0xEC, 0x58, 0x6F, 0xAA, 0x43, 0xF3, 0x46, 0x23, 0x33, 0xB8, 0x44, 0x83, 0x45, 0x54};
+
+    md5_byte_t pif_ntsc_md5[] = {0x5C, 0x12, 0x4E, 0x79, 0x48, 0xAD, 0xA8, 0x5D, 0xA6, 0x03, 0xA5, 0x22, 0x78, 0x29, 0x40, 0xD0};
+    md5_byte_t pif_pal_md5[]  = {0xD4, 0x23, 0x2D, 0xC9, 0x35, 0xCA, 0xD0, 0x65, 0x0A, 0xC2, 0x66, 0x4D, 0x52, 0x28, 0x1F, 0x3A};
+
+    uint32_t *dst32 = mem_base_u32(g_mem_base, MM_PIF_MEM);
+    uint32_t *src32 = (uint32_t*) pifimage;
+    md5_state_t state;
+    md5_byte_t digest[16];
+
+    md5_init(&state);
+    md5_append(&state, (const md5_byte_t*)pifimage, size);
+    md5_finish(&state, digest);
+
+    if (memcmp(digest, old_pif_ntsc_md5, 16) == 0 ||
+        memcmp(digest, pif_ntsc_md5, 16) == 0)
+    {
+        DebugMessage(M64MSG_INFO, "Using NTSC PIF ROM");
+    }
+    else if (memcmp(digest, old_pif_pal_md5, 16) == 0 ||
+             memcmp(digest, pif_pal_md5, 16) == 0)
+    {
+        DebugMessage(M64MSG_INFO, "Using PAL PIF ROM");
+    }
+    else
+    {
+        DebugMessage(M64MSG_ERROR, "Invalid PIF ROM");
+        return M64ERR_INPUT_INVALID;
+    }
+
+    for (unsigned int i = 0; i < size; i += 4)
+        *dst32++ = big32(*src32++);
+
+    g_start_address = UINT32_C(0xbfc00000);
+    return M64ERR_SUCCESS;
+}
+
+m64p_error close_pif(void)
+{
+    g_start_address = UINT32_C(0xa4000040);
+    return M64ERR_SUCCESS;
 }

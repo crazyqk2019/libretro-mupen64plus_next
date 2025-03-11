@@ -28,24 +28,24 @@
 #include <compat/strl.h>
 #include <compat/posix_string.h>
 
-struct queue_elem
+bool msg_queue_initialize(msg_queue_t *queue, size_t size)
 {
-   unsigned duration;
-   unsigned prio;
-   char *msg;
+   struct queue_elem **elems = NULL;
 
-   char *title;
-   enum message_queue_icon icon;
-   enum message_queue_category category;
-};
+   if (!queue)
+      return false;
 
-struct msg_queue
-{
-   struct queue_elem **elems;
-   size_t ptr;
-   size_t size;
-   char *tmp_msg;
-};
+   if (!(elems = (struct queue_elem**)
+            calloc(size + 1, sizeof(struct queue_elem*))))
+      return false;
+
+   queue->tmp_msg            = NULL;
+   queue->elems              = elems;
+   queue->ptr                = 1;
+   queue->size               = size + 1;
+
+   return true;
+}
 
 /**
  * msg_queue_new:
@@ -58,25 +58,14 @@ struct msg_queue
  **/
 msg_queue_t *msg_queue_new(size_t size)
 {
-   struct queue_elem **elems = NULL;
-   msg_queue_t *queue        = (msg_queue_t*)calloc(1, sizeof(*queue));
+   msg_queue_t *queue = (msg_queue_t*)malloc(sizeof(*queue));
 
-   if (!queue)
-      return NULL;
-
-   queue->size = size + 1;
-
-   elems = (struct queue_elem**)calloc(queue->size,
-         sizeof(struct queue_elem*));
-
-   if (!elems)
+   if (!msg_queue_initialize(queue, size))
    {
-      free(queue);
+      if (queue)
+         free(queue);
       return NULL;
    }
-
-   queue->elems = elems;
-   queue->ptr   = 1;
 
    return queue;
 }
@@ -89,12 +78,24 @@ msg_queue_t *msg_queue_new(size_t size)
  **/
 void msg_queue_free(msg_queue_t *queue)
 {
-   if (queue)
-   {
-      msg_queue_clear(queue);
-      free(queue->elems);
-   }
+   if (!queue)
+      return;
+   msg_queue_clear(queue);
+   free(queue->elems);
    free(queue);
+}
+
+bool msg_queue_deinitialize(msg_queue_t *queue)
+{
+   if (!queue)
+      return false;
+   msg_queue_clear(queue);
+   free(queue->elems);
+   queue->elems   = NULL;
+   queue->tmp_msg = NULL;
+   queue->ptr     = 0;
+   queue->size    = 0;
+   return true;
 }
 
 /**
@@ -119,14 +120,12 @@ void msg_queue_push(msg_queue_t *queue, const char *msg,
    if (!queue || queue->ptr >= queue->size)
       return;
 
-   new_elem                      = (struct queue_elem*)
-      calloc(1, sizeof(struct queue_elem));
-   if (!new_elem)
+   if (!(new_elem = (struct queue_elem*)malloc(sizeof(struct queue_elem))))
       return;
 
-   new_elem->prio                = prio;
    new_elem->duration            = duration;
-   new_elem->msg                 = msg ? strdup(msg) : NULL;
+   new_elem->prio                = prio;
+   new_elem->msg                 = msg   ? strdup(msg)   : NULL;
    new_elem->title               = title ? strdup(title) : NULL;
    new_elem->icon                = icon;
    new_elem->category            = category;
@@ -173,7 +172,7 @@ void msg_queue_clear(msg_queue_t *queue)
          queue->elems[i] = NULL;
       }
    }
-   queue->ptr = 1;
+   queue->ptr     = 1;
    free(queue->tmp_msg);
    queue->tmp_msg = NULL;
 }
@@ -191,8 +190,6 @@ const char *msg_queue_pull(msg_queue_t *queue)
 {
    struct queue_elem *front  = NULL, *last = NULL;
    size_t tmp_ptr = 1;
-
-   (void)tmp_ptr;
 
    /* Nothing in queue. */
    if (!queue || queue->ptr == 1)
@@ -262,8 +259,6 @@ bool msg_queue_extract(msg_queue_t *queue, msg_queue_entry_t *queue_entry)
 {
    struct queue_elem *front  = NULL, *last = NULL;
    size_t tmp_ptr = 1;
-
-   (void)tmp_ptr;
 
    /* Ensure arguments are valid and queue is not
     * empty */

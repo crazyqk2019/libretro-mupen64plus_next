@@ -437,6 +437,10 @@ static void gen_CP1_CVT_S(struct r4300_core* r4300)
 #define gen_SCD        genni
 #define gen_SDC2       genni
 #define gen_SWC2       genni
+#define gen_DCFC1      genni
+#define gen_DCFC2      genni
+#define gen_DCTC1      genni
+#define gen_DCTC2      genni
 
 #define X(op) gen_##op
 static void (*const recomp_funcs[R4300_OPCODES_COUNT])(struct r4300_core* r4300) =
@@ -891,7 +895,7 @@ void dynarec_setup_code(void)
     /* The dynarec jumps here after we call dyna_start and it prepares
      * Here we need to prepare the initial code block and jump to it
      */
-    dynarec_jump_to(r4300, UINT32_C(0xa4000040));
+    dynarec_jump_to(r4300, r4300->start_address);
 
     /* Prevent segfault on failed dynarec_jump_to */
     if (!r4300->cached_interp.actual->block || !r4300->cached_interp.actual->code) {

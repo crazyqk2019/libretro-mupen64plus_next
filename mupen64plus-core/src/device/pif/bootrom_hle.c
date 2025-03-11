@@ -47,6 +47,8 @@ static unsigned int get_tv_type(void)
 
 void pif_bootrom_hle_execute(struct r4300_core* r4300)
 {
+    if (r4300->start_address == 0xbfc00000) return;
+
     uint32_t pif24;
     unsigned int seed;       /* seed (depends on CIC version) */
     unsigned int rom_type;   /* 0:Cart, 1:DD */
@@ -60,7 +62,7 @@ void pif_bootrom_hle_execute(struct r4300_core* r4300)
 
     /* setup CP0 registers */
     cp0_regs[CP0_STATUS_REG] = 0x34000000;
-    cp0_regs[CP0_CONFIG_REG] = 0x0006e463;
+    cp0_regs[CP0_CONFIG_REG] = 0x7006e463;
 
     /* XXX: wait for SP to finish last operation (poll halt) */
 

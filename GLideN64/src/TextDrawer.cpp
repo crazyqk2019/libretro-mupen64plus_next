@@ -22,9 +22,10 @@
 
 #include "TextDrawer.h"
 
+#include <osal_files.h>
+
 #ifdef MUPENPLUSAPI
 #include "mupenplus/GLideN64_mupenplus.h"
-#include <osal_files.h>
 #endif
 
 using namespace graphics;
@@ -90,16 +91,16 @@ struct Atlas {
 		m_pTexture->mirrorT = 0;
 		m_pTexture->width = w;
 		m_pTexture->height = h;
-		m_pTexture->textureBytes = m_pTexture->width * m_pTexture->height * fbTexFormats.noiseFormatBytes;
+		m_pTexture->textureBytes = m_pTexture->width * m_pTexture->height * fbTexFormats.fontFormatBytes;
 
 		Context::InitTextureParams initParams;
 		initParams.handle = m_pTexture->name;
 		initParams.textureUnitIndex = textureIndices::Tex[0];
 		initParams.width = w;
 		initParams.height = h;
-		initParams.internalFormat = fbTexFormats.noiseInternalFormat;
-		initParams.format = fbTexFormats.noiseFormat;
-		initParams.dataType = fbTexFormats.noiseType;
+		initParams.internalFormat = fbTexFormats.fontInternalFormat;
+		initParams.format = fbTexFormats.fontFormat;
+		initParams.dataType = fbTexFormats.fontType;
 		gfxContext.init2DTexture(initParams);
 
 		Context::TexParameters setParams;
@@ -155,6 +156,12 @@ bool getFontFileName(char * _strName)
 #else
 	sprintf(_strName, "/usr/share/fonts/truetype/freefont/%s", config.font.name.c_str());
 #endif
+
+	// if the font name is a full path, use that instead
+	if (osal_path_existsA(config.font.name.c_str())) {
+		sprintf(_strName, "%s", config.font.name.c_str());
+	}
+
 #ifdef MUPENPLUSAPI
 	if (!osal_path_existsA(_strName)) {
 		const char * fontPath = ConfigGetSharedDataFilepath("font.ttf");
@@ -270,6 +277,17 @@ void TextDrawer::drawText(const char *_pText, float _x, float _y) const
 	gfxContext.enableDepthWrite(false);
 	gfxContext.setBlending(blend::SRC_ALPHA, blend::ONE_MINUS_SRC_ALPHA);
 	m_program->activate();
+
+	const s32 X = (wnd.getScreenWidth() - wnd.getWidth()) / 2;
+	const s32 Y = (wnd.getScreenHeight() - wnd.getHeight()) / 2 + wnd.getHeightOffset();
+	const s32 W = static_cast<s32>(wnd.getWidth());
+	const s32 H = static_cast<s32>(wnd.getHeight());
+
+	gfxContext.setViewport(X, Y, W, H);
+	gfxContext.setScissor(X, Y, W, H);
+
+	gSP.changed |= CHANGED_VIEWPORT;
+	gDP.changed |= CHANGED_SCISSOR;
 
 	Context::TexParameters setParams;
 	setParams.handle = m_atlas->m_pTexture->name;

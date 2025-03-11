@@ -27,6 +27,14 @@
 
 #include "new_dynarec/new_dynarec.h"
 
+#define FCR31_FS_BIT UINT32_C(0x1000000)
+
+#ifdef M64P_BIG_ENDIAN
+#define DOUBLE_HALF_XOR 1
+#else
+#define DOUBLE_HALF_XOR 0
+#endif
+
 void init_cp1(struct cp1* cp1, struct new_dynarec_hot_state* new_dynarec_hot_state)
 {
 #ifdef NEW_DYNAREC
@@ -37,10 +45,13 @@ void init_cp1(struct cp1* cp1, struct new_dynarec_hot_state* new_dynarec_hot_sta
 void poweron_cp1(struct cp1* cp1)
 {
     memset(cp1->regs, 0, 32 * sizeof(cp1->regs[0]));
-    *r4300_cp1_fcr0(cp1) = UINT32_C(0x511);
+    *r4300_cp1_fcr0(cp1) = UINT32_C(0xA00);
     *r4300_cp1_fcr31(cp1) = 0;
 
     set_fpr_pointers(cp1, UINT32_C(0x34000000)); /* c0_status value at poweron */
+#ifdef OSAL_SSE
+    cp1->flush_mode = _MM_GET_FLUSH_ZERO_MODE();
+#endif
     update_x86_rounding_mode(cp1);
 }
 
@@ -76,7 +87,7 @@ uint32_t* r4300_cp1_fcr0(struct cp1* cp1)
 	/* New dynarec uses a different memory layout */
     return &cp1->fcr0;
 #else
-    return &cp1->new_dynarec_hot_state->fcr0;
+    return &cp1->new_dynarec_hot_state->cp1_fcr0;
 #endif
 }
 
@@ -86,7 +97,7 @@ uint32_t* r4300_cp1_fcr31(struct cp1* cp1)
 	/* New dynarec uses a different memory layout */
     return &cp1->fcr31;
 #else
-    return &cp1->new_dynarec_hot_state->fcr31;
+    return &cp1->new_dynarec_hot_state->cp1_fcr31;
 #endif
 }
 
@@ -99,7 +110,7 @@ void set_fpr_pointers(struct cp1* cp1, uint32_t newStatus)
     {
         for (i = 0; i < 32; i++)
         {
-            (r4300_cp1_regs_simple(cp1))[i] = &cp1->regs[i & ~1].float32[i & 1];
+            (r4300_cp1_regs_simple(cp1))[i] = &cp1->regs[i & ~1].float32[(i & 1) ^ DOUBLE_HALF_XOR];
             (r4300_cp1_regs_double(cp1))[i] = &cp1->regs[i & ~1].float64;
         }
     }
@@ -107,7 +118,7 @@ void set_fpr_pointers(struct cp1* cp1, uint32_t newStatus)
     {
         for (i = 0; i < 32; i++)
         {
-            (r4300_cp1_regs_simple(cp1))[i] = &cp1->regs[i].float32[0];
+            (r4300_cp1_regs_simple(cp1))[i] = &cp1->regs[i].float32[DOUBLE_HALF_XOR];
             (r4300_cp1_regs_double(cp1))[i] = &cp1->regs[i].float64;
         }
     }
@@ -119,6 +130,20 @@ void set_fpr_pointers(struct cp1* cp1, uint32_t newStatus)
 void update_x86_rounding_mode(struct cp1* cp1)
 {
     uint32_t fcr31 = *r4300_cp1_fcr31(cp1);
+
+#ifdef OSAL_SSE
+    uint32_t flush_mode;
+    if (fcr31 & 2)
+        flush_mode = (fcr31 & FCR31_FS_BIT) ? _MM_FLUSH_ZERO_OFF : _MM_FLUSH_ZERO_ON;
+    else
+        flush_mode = _MM_FLUSH_ZERO_ON;
+
+    if (flush_mode != cp1->flush_mode)
+    {
+        _MM_SET_FLUSH_ZERO_MODE(flush_mode);
+        cp1->flush_mode = flush_mode;
+    }
+#endif
 
     switch (fcr31 & 3)
     {
