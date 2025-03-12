@@ -578,14 +578,14 @@ else
    LDFLAGS += -shared -static-libgcc -static-libstdc++ -Wl,--version-script=$(LIBRETRO_DIR)/link.T #-static -lmingw32 -lSDL2main -lSDL2 -mwindows -lm -ldinput8 -ldxguid -ldxerr8 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lshell32 -lversion -luuid  -lsdl2_net -lsdl2 -lws2_32 -lSetupapi -lIPHLPAPI
    GL_LIB := -lopengl32
    
-   ifeq ($(MSYSTEM),MINGW64)
+   ifneq ($(filter MINGW64 UCRT64,$(MSYSTEM)),)
       CC ?= x86_64-w64-mingw32-gcc
       CXX ?= x86_64-w64-mingw32-g++
       WITH_DYNAREC = x86_64
       COREFLAGS += -DWIN64 #-DM64P_NETPLAY
       ASFLAGS = -f win64 -d WIN64
       PIC = 1
-   else ifeq ($(MSYSTEM),MINGW32)
+   else ifneq ($(filter MINGW32 UCRT32,$(MSYSTEM)),)
       CC ?= i686-w64-mingw32-gcc
       CXX ?= i686-w64-mingw32-g++
       WITH_DYNAREC = x86
