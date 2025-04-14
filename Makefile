@@ -585,7 +585,7 @@ else
       COREFLAGS += -DWIN64 #-DM64P_NETPLAY
       ASFLAGS = -f win64 -d WIN64
       PIC = 1
-   else ifneq ($(filter MINGW32 UCRT32,$(MSYSTEM)),)
+   else ifneq ($(filter MINGW32,$(MSYSTEM)),)
       CC ?= i686-w64-mingw32-gcc
       CXX ?= i686-w64-mingw32-g++
       WITH_DYNAREC = x86
